@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 import branca.colormap as cm
 import logging
+import time
+from IPython.display import display, clear_output
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,8 +24,15 @@ class RouteVisualizer:
         """
         self.buildings_df = buildings_df
         self.streets_df = streets_df
-        self.center_lat = buildings_df.geometry.centroid.y.mean()
-        self.center_lon = buildings_df.geometry.centroid.x.mean()
+        
+        # Transformacja do układu współrzędnych rzutowanych (EPSG:2180 dla Polski)
+        buildings_projected = buildings_df.to_crs(epsg=2180)
+        self.center_lat = buildings_projected.geometry.centroid.y.mean()
+        self.center_lon = buildings_projected.geometry.centroid.x.mean()
+        
+        # Konwersja z powrotem do stopni
+        self.center_lat = self.center_lat / 111000  # konwersja z metrów na stopnie
+        self.center_lon = self.center_lon / (111000 * np.cos(np.radians(self.center_lat)))  # uwzględnienie szerokości geograficznej
         
     def create_base_map(self, zoom_start: int = 13) -> folium.Map:
         """
@@ -229,4 +238,63 @@ class RouteVisualizer:
             plt.savefig(save_path)
             logger.info(f"Wykres zapisany w: {save_path}")
             
-        plt.show() 
+        plt.show()
+        
+    def visualize_optimization_process(
+        self,
+        population: List[List[Tuple[float, float]]],
+        scores: List[float],
+        generation: int,
+        best_route: List[Tuple[float, float]],
+        best_score: float,
+        bounds: Tuple[float, float, float, float],
+        density_map: np.ndarray,
+        update_interval: float = 0.5
+    ) -> None:
+        """
+        Wizualizuje proces optymalizacji w czasie rzeczywistym.
+        
+        Args:
+            population: Aktualna populacja tras
+            scores: Oceny tras w populacji
+            generation: Numer aktualnego pokolenia
+            best_route: Najlepsza znaleziona trasa
+            best_score: Ocena najlepszej trasy
+            bounds: Granice obszaru
+            density_map: Mapa gęstości zabudowy
+            update_interval: Czas między aktualizacjami wizualizacji (w sekundach)
+        """
+        m = self.create_base_map()
+        
+        # Dodawanie mapy gęstości
+        m = self.plot_density_map(density_map, bounds, m)
+        
+        # Dodawanie wszystkich tras z populacji (przezroczyste)
+        for i, route in enumerate(population):
+            self.plot_route(
+                route, m,
+                route_name=f"Trasa {i+1}",
+                color='gray',
+                opacity=0.2
+            )
+        
+        # Dodawanie najlepszej trasy (wyraźna)
+        self.plot_route(
+            best_route, m,
+            route_name="Najlepsza trasa",
+            color='blue',
+            opacity=0.8
+        )
+        
+        # Dodawanie informacji o pokoleniu i ocenie
+        folium.Popup(
+            f'Pokolenie: {generation}\n'
+            f'Najlepsza ocena: {best_score:.2f}\n'
+            f'Średnia ocena: {np.mean(scores):.2f}',
+            max_width=300
+        ).add_to(m)
+        
+        # Wyświetlanie mapy
+        display(m)
+        clear_output(wait=True)
+        time.sleep(update_interval) 
