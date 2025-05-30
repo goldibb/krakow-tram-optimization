@@ -41,14 +41,14 @@ def main():
     
     # Konfiguracja ograniczeń
     constraints = RouteConstraints(
-        min_distance_between_stops=300,  # 300m między przystankami
-        max_distance_between_stops=1000,  # 1000m między przystankami
-        max_angle=45,  # maksymalny kąt zakrętu
-        min_route_length=5,  # minimalna liczba przystanków
-        max_route_length=15,  # maksymalna liczba przystanków
-        min_total_length=2000,  # minimalna długość trasy
-        max_total_length=10000,  # maksymalna długość trasy
-        min_distance_from_buildings=5  # minimalna odległość od budynków
+        min_distance_between_stops=200,  # 200m między przystankami
+        max_distance_between_stops=1500,  # 1500m między przystankami
+        max_angle=60,  # maksymalny kąt zakrętu
+        min_route_length=3,  # minimalna liczba przystanków
+        max_route_length=20,  # maksymalna liczba przystanków
+        min_total_length=1000,  # minimalna długość trasy
+        max_total_length=15000,  # maksymalna długość trasy
+        min_distance_from_buildings=3  # minimalna odległość od budynków
     )
     
     # Inicjalizacja optymalizatora
@@ -62,7 +62,11 @@ def main():
         population_size=100,
         generations=50,
         mutation_rate=0.1,
-        crossover_rate=0.8
+        crossover_rate=0.8,
+        min_stop_distance=200,  # 200 metrów
+        max_stop_distance=1500,  # 1500 metrów
+        population_weight=0.7,
+        distance_weight=0.3
     )
     
     # Uruchomienie optymalizacji

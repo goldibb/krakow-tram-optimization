@@ -451,41 +451,110 @@ class RouteOptimizer:
                 return True
         return False
     
+    def _calculate_distance(self, point1: Tuple[float, float], point2: Tuple[float, float]) -> float:
+        """
+        Bezpiecznie oblicza odległość między dwoma punktami w metrach.
+        
+        Args:
+            point1: Pierwszy punkt (lat, lon)
+            point2: Drugi punkt (lat, lon)
+            
+        Returns:
+            float: Odległość w metrach lub 0 w przypadku błędu
+        """
+        try:
+            if not (self._validate_coordinates(point1) and self._validate_coordinates(point2)):
+                logger.warning(f"Nieprawidłowe współrzędne: {point1} lub {point2}")
+                return 0
+            
+            # Sprawdzenie czy współrzędne nie są None lub NaN
+            if any(p is None or np.isnan(p) for p in point1 + point2):
+                logger.warning(f"Współrzędne zawierają None lub NaN: {point1}, {point2}")
+                return 0
+            
+            # Konwersja punktów do układu EPSG:2180
+            p1 = gpd.GeoDataFrame(
+                geometry=[Point(point1[1], point1[0])],  # (lon, lat)
+                crs="EPSG:4326"
+            ).to_crs(epsg=2180)
+            
+            p2 = gpd.GeoDataFrame(
+                geometry=[Point(point2[1], point2[0])],  # (lon, lat)
+                crs="EPSG:4326"
+            ).to_crs(epsg=2180)
+            
+            # Sprawdzenie czy geometrie są prawidłowe
+            if p1.geometry.isna().any() or p2.geometry.isna().any():
+                logger.warning("Nieprawidłowe geometrie po konwersji")
+                return 0
+            
+            # Obliczanie odległości w metrach
+            distance = float(p1.geometry[0].distance(p2.geometry[0]))
+            
+            # Sprawdzenie czy odległość jest prawidłowa
+            if np.isnan(distance) or np.isinf(distance):
+                logger.warning(f"Nieprawidłowa odległość: {distance}")
+                return 0
+            
+            return distance
+            
+        except Exception as e:
+            logger.warning(f"Błąd podczas obliczania odległości: {str(e)}")
+            return 0
+
     def _is_valid_route(self, route: List[Tuple[float, float]]) -> bool:
         """Sprawdza czy trasa spełnia wszystkie ograniczenia."""
-        # Sprawdzenie długości trasy
-        if not (self.constraints.min_route_length <= len(route) <= self.constraints.max_route_length):
-            return False
-            
-        # Sprawdzenie całkowitej długości
-        total_length = self._calculate_total_length(route)
-        if not (self.constraints.min_total_length <= total_length <= self.constraints.max_total_length):
-            return False
-            
-        # Sprawdzenie początkowego przystanku
-        if not self._is_valid_start_stop(route[0]):
-            return False
-            
-        # Sprawdzenie odległości między przystankami i kątów
-        for i in range(len(route) - 1):
-            distance = distance.euclidean(route[i], route[i+1])
-            if not (self.min_stop_distance <= distance <= self.max_stop_distance):
+        try:
+            # Sprawdzenie długości trasy
+            if not (self.constraints.min_route_length <= len(route) <= self.constraints.max_route_length):
+                logger.debug(f"Nieprawidłowa długość trasy: {len(route)}")
                 return False
                 
-            if i > 0:
-                angle = self._calculate_angle(route[i-1], route[i], route[i+1])
-                if angle > self.constraints.max_angle:
+            # Sprawdzenie całkowitej długości
+            total_length = 0
+            for i in range(len(route) - 1):
+                dist = self._calculate_distance(route[i], route[i + 1])
+                if dist == 0:  # Błąd podczas obliczania odległości
                     return False
-        
-        # Sprawdzenie kolizji z istniejącymi liniami
-        if self._check_collision_with_existing_lines(route):
-            return False
+                total_length += dist
+                
+            if not (self.constraints.min_total_length <= total_length <= self.constraints.max_total_length):
+                logger.debug(f"Nieprawidłowa całkowita długość trasy: {total_length}m")
+                return False
+                
+            # Sprawdzenie początkowego przystanku
+            if not self._is_valid_start_stop(route[0]):
+                logger.debug("Nieprawidłowy przystanek początkowy")
+                return False
+                
+            # Sprawdzenie odległości między przystankami i kątów
+            for i in range(len(route) - 1):
+                dist = self._calculate_distance(route[i], route[i + 1])
+                if not (self.min_stop_distance <= dist <= self.max_stop_distance):
+                    logger.debug(f"Nieprawidłowa odległość między przystankami: {dist}m")
+                    return False
+                    
+                if i > 0:
+                    angle = self._calculate_angle(route[i-1], route[i], route[i+1])
+                    if angle > self.constraints.max_angle:
+                        logger.debug(f"Nieprawidłowy kąt zakrętu: {angle}°")
+                        return False
             
-        # Sprawdzenie kolizji z budynkami
-        if self._check_collision_with_buildings(route):
-            return False
+            # Sprawdzenie kolizji z istniejącymi liniami
+            if self._check_collision_with_existing_lines(route):
+                logger.debug("Wykryto kolizję z istniejącymi liniami")
+                return False
+                
+            # Sprawdzenie kolizji z budynkami
+            if self._check_collision_with_buildings(route):
+                logger.debug("Wykryto kolizję z budynkami")
+                return False
+                
+            return True
             
-        return True
+        except Exception as e:
+            logger.warning(f"Błąd podczas sprawdzania trasy: {str(e)}")
+            return False
     
     def _evaluate_route(self, route: List[Tuple[float, float]]) -> float:
         """Ocenia jakość trasy."""
@@ -509,8 +578,12 @@ class RouteOptimizer:
         population = []
         valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
         
+        logger.info(f"Liczba dostępnych przystanków: {len(valid_stops)}")
+        logger.info(f"Ograniczenia: min_route_length={self.constraints.min_route_length}, "
+                   f"max_route_length={self.constraints.max_route_length}")
+        
         attempts = 0
-        max_attempts = self.population_size * 20  # Zwiększamy maksymalną liczbę prób
+        max_attempts = self.population_size * 20
         
         while len(population) < self.population_size and attempts < max_attempts:
             try:
@@ -530,6 +603,7 @@ class RouteOptimizer:
                 # Jeśli nie ma wystarczająco dużo przystanków, zmniejsz długość trasy
                 if len(remaining_stops) < route_length - 1:
                     route_length = len(remaining_stops) + 1
+                    logger.info(f"Dostosowano długość trasy do {route_length} (dostępne przystanki: {len(remaining_stops) + 1})")
                 
                 # Dodaj pozostałe przystanki
                 if len(remaining_stops) > 0:
@@ -539,6 +613,8 @@ class RouteOptimizer:
                 if self._is_valid_route(route):
                     population.append(route)
                     logger.info(f"Utworzono trasę {len(population)}/{self.population_size}")
+                else:
+                    logger.debug(f"Trasa nie spełnia ograniczeń: {route}")
                 
             except Exception as e:
                 logger.warning(f"Błąd podczas tworzenia trasy: {str(e)}")
@@ -546,9 +622,23 @@ class RouteOptimizer:
             attempts += 1
             
         if len(population) == 0:
-            logger.error("Nie udało się utworzyć początkowej populacji!")
-            # Zwróć prostą populację z minimalną liczbą tras
-            return [[valid_stops[0], valid_stops[-1]]] * self.population_size
+            logger.warning("Nie udało się utworzyć populacji z pełnymi ograniczeniami!")
+            logger.info("Tworzę uproszczoną populację...")
+            
+            # Tworzymy uproszczoną populację z minimalną liczbą tras
+            simplified_population = []
+            for _ in range(self.population_size):
+                # Wybierz dwa losowe przystanki
+                if len(valid_stops) >= 2:
+                    start = random.choice(valid_stops)
+                    end = random.choice([s for s in valid_stops if s != start])
+                    simplified_population.append([start, end])
+                else:
+                    # Jeśli nie ma wystarczająco dużo przystanków, użyj tego samego przystanku
+                    simplified_population.append([valid_stops[0], valid_stops[0]])
+            
+            logger.info(f"Utworzono uproszczoną populację o rozmiarze {len(simplified_population)}")
+            return simplified_population
             
         return population
     

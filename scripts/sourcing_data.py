@@ -303,26 +303,14 @@ class OpenStreetMapData:
         )[['geometry']].dropna()
         logging.info(f"Successfully retrieved {len(self.buildings_df)} buildings.")
 
-        self.buildings_df = self._calculate_centroid(self.buildings_df)
+        # Konwersja do układu współrzędnych rzutowanych przed obliczeniem centroidu
+        self.buildings_df = self.buildings_df.to_crs(epsg=2180)  # EPSG:2180 dla Polski
+        self.buildings_df["centroid"] = self.buildings_df.geometry.centroid
+        # Konwersja z powrotem do układu geograficznego
+        self.buildings_df = self.buildings_df.to_crs(epsg=4326)
 
     def _fetch_streets(self) -> None:
         """Fetches street geometries from OSM as a GeoDataFrame."""
         graph = ox.graph_from_place(self.place, network_type="all")
         self.streets_df = ox.graph_to_gdfs(graph, nodes=False)
         logging.info(f"Successfully retrieved {len(self.streets_df)} street segments.")
-
-    @staticmethod
-    def _calculate_centroid(df: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-        """Calculates the centroid of each building polygon.
-
-        Args:
-            df (gpd.GeoDataFrame): GeoDataFrame containing building geometries.
-
-        Returns:
-            gpd.GeoDataFrame: GeoDataFrame with centroid coordinates.
-        """
-        df = df.copy()
-        df["centroid"] = df.geometry.centroid
-        df["lat"] = df["centroid"].y
-        df["lng"] = df["centroid"].x
-        return df.drop(columns=["centroid"])
