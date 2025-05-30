@@ -197,8 +197,10 @@ class RouteOptimizer:
                 return False
             
             if is_wgs84:
-                # Sprawdzenie czy wartości są w rozsądnym zakresie dla WGS84 (Kraków)
-                if not (49.9 <= x <= 50.2 and 19.8 <= y <= 20.1):
+                # Sprawdzenie czy wartości są w rozsądnym zakresie dla WGS84 (Kraków i okolice)
+                # Rozszerzony zakres dla większego obszaru Krakowa
+                if not (49.8 <= x <= 50.3 and 19.5 <= y <= 20.5):
+                    logger.debug(f"Współrzędne WGS84 poza zakresem: lat={x} (49.8-50.3), lon={y} (19.5-20.5)")
                     return False
             else:
                 # Sprawdzenie czy wartości są w rozsądnym zakresie dla EPSG:2180
@@ -262,28 +264,40 @@ class RouteOptimizer:
             Optional[Tuple[float, float]]: Najbliższy punkt lub None jeśli nie znaleziono
         """
         min_dist = float('inf')
-        nearest_point = None
+        nearest_point_wgs84 = None
+        
+        # Konwersja punktu wejściowego do EPSG:2180 raz na początku
+        try:
+            point_gdf = gpd.GeoDataFrame(
+                geometry=[Point(point[1], point[0])],  # (lon, lat)
+                crs="EPSG:4326"
+            ).to_crs(epsg=2180)
+            point_epsg2180 = (point_gdf.geometry.x[0], point_gdf.geometry.y[0])  # (x, y)
+        except Exception as e:
+            logger.warning(f"Błąd konwersji punktu do EPSG:2180: {str(e)}")
+            return None
         
         # Sprawdzenie wszystkich węzłów w grafie (węzły są w EPSG:2180)
         for node in self.street_graph.nodes():
-            # node jest w formacie (x, y) EPSG:2180
-            # Konwersja węzła z EPSG:2180 do WGS84
-            node_gdf = gpd.GeoDataFrame(
-                geometry=[Point(node[0], node[1])],  # (x, y) w EPSG:2180
-                crs="EPSG:2180"
-            ).to_crs(epsg=4326)
-            
-            node_wgs84 = (node_gdf.geometry.y[0], node_gdf.geometry.x[0])  # (lat, lon)
-            
-            # Użyj unifiednej metody obliczania odległości
-            dist = self._calculate_distance(point, node_wgs84, is_wgs84=True)
+            # node jest już w formacie (x, y) EPSG:2180
+            # Używamy bezpośredniego obliczenia odległości w EPSG:2180
+            dist = self._calculate_distance(point_epsg2180, node, is_wgs84=False)
             
             if dist < min_dist and dist > 0:
                 min_dist = dist
-                nearest_point = node_wgs84  # Zwróć punkt w WGS84
+                # Konwertuj wybrany węzeł z powrotem do WGS84 tylko raz
+                try:
+                    node_gdf = gpd.GeoDataFrame(
+                        geometry=[Point(node[0], node[1])],  # (x, y) w EPSG:2180
+                        crs="EPSG:2180"
+                    ).to_crs(epsg=4326)
+                    nearest_point_wgs84 = (node_gdf.geometry.y[0], node_gdf.geometry.x[0])  # (lat, lon)
+                except Exception as e:
+                    logger.warning(f"Błąd konwersji węzła do WGS84: {str(e)}")
+                    continue
         
-        if min_dist <= max_distance:
-            return nearest_point
+        if min_dist <= max_distance and nearest_point_wgs84 is not None:
+            return nearest_point_wgs84
         
         logger.warning(f"Nie znaleziono punktu w zasięgu {max_distance}m")
         return None
@@ -356,28 +370,33 @@ class RouteOptimizer:
             List[Tuple[float, float]]: Wygenerowana trasa
         """
         try:
-            # Konwersja punktów do formatu (lon, lat) dla grafu
-            start_node = (start_point[1], start_point[0])  # (lon, lat)
-            end_node = (end_point[1], end_point[0])  # (lon, lat)
-            
             # Znajdź najbliższe węzły w grafie
             start_node_in_graph = None
             end_node_in_graph = None
             min_start_dist = float('inf')
             min_end_dist = float('inf')
             
+            # Konwertuj punkty start i end do EPSG:2180 raz na początku
+            try:
+                start_gdf = gpd.GeoDataFrame(
+                    geometry=[Point(start_point[1], start_point[0])],  # (lon, lat)
+                    crs="EPSG:4326"
+                ).to_crs(epsg=2180)
+                start_epsg2180 = (start_gdf.geometry.x[0], start_gdf.geometry.y[0])
+                
+                end_gdf = gpd.GeoDataFrame(
+                    geometry=[Point(end_point[1], end_point[0])],  # (lon, lat)
+                    crs="EPSG:4326"
+                ).to_crs(epsg=2180)
+                end_epsg2180 = (end_gdf.geometry.x[0], end_gdf.geometry.y[0])
+            except Exception as e:
+                logger.error(f"Błąd konwersji punktów do EPSG:2180: {str(e)}")
+                return [start_point, end_point]
+            
             for node in self.street_graph.nodes():
-                # Użyj bezpiecznej metody obliczania odległości
-                start_dist = self._calculate_distance(
-                    (node[1], node[0]),  # (lat, lon)
-                    (start_point[0], start_point[1]),  # (lat, lon)
-                    is_wgs84=True
-                )
-                end_dist = self._calculate_distance(
-                    (node[1], node[0]),  # (lat, lon)
-                    (end_point[0], end_point[1]),  # (lat, lon)
-                    is_wgs84=True
-                )
+                # Użyj bezpośredniego obliczania odległości w EPSG:2180
+                start_dist = self._calculate_distance(start_epsg2180, node, is_wgs84=False)
+                end_dist = self._calculate_distance(end_epsg2180, node, is_wgs84=False)
                 
                 if start_dist < min_start_dist and start_dist > 0:
                     min_start_dist = start_dist
@@ -435,26 +454,45 @@ class RouteOptimizer:
     
     def _is_valid_start_stop(self, point: Tuple[float, float]) -> bool:
         """Sprawdza czy punkt jest istniejącym przystankiem."""
-        point_geom = Point(point[1], point[0])  # zamiana lat,lon na lon,lat
-        for _, row in self.stops_df.iterrows():
-            if point_geom.distance(row.geometry) < 0.0001:  # mała tolerancja
-                return True
+        if self.stops_df is None:
+            return True  # Jeśli nie ma przystanków, akceptuj każdy punkt
+            
+        try:
+            point_geom = Point(point[1], point[0])  # zamiana lat,lon na lon,lat
+            for _, row in self.stops_df.iterrows():
+                if point_geom.distance(row.geometry) < 0.0001:  # mała tolerancja
+                    return True
+        except Exception as e:
+            logger.debug(f"Błąd podczas sprawdzania przystanku: {str(e)}")
+            return True  # W przypadku błędu, akceptuj punkt
         return False
     
     def _check_collision_with_existing_lines(self, route: List[Tuple[float, float]]) -> bool:
         """Sprawdza kolizje z istniejącymi liniami tramwajowymi."""
-        route_line = LineString([(lon, lat) for lat, lon in route])
-        for _, row in self.lines_df.iterrows():
-            if isinstance(row.geometry, LineString) and route_line.intersects(row.geometry):
-                return True
+        if self.lines_df is None or len(route) < 2:
+            return False
+            
+        try:
+            route_line = LineString([(lon, lat) for lat, lon in route])
+            for _, row in self.lines_df.iterrows():
+                if isinstance(row.geometry, LineString) and route_line.intersects(row.geometry):
+                    return True
+        except Exception as e:
+            logger.debug(f"Błąd podczas sprawdzania kolizji z liniami: {str(e)}")
         return False
     
     def _check_collision_with_buildings(self, route: List[Tuple[float, float]]) -> bool:
         """Sprawdza kolizje z budynkami."""
-        route_line = LineString([(lon, lat) for lat, lon in route])
-        for _, row in self.buildings_df.iterrows():
-            if route_line.intersects(row.geometry):
-                return True
+        if self.buildings_df is None or len(route) < 2:
+            return False
+            
+        try:
+            route_line = LineString([(lon, lat) for lat, lon in route])
+            for _, row in self.buildings_df.iterrows():
+                if route_line.intersects(row.geometry):
+                    return True
+        except Exception as e:
+            logger.debug(f"Błąd podczas sprawdzania kolizji z budynkami: {str(e)}")
         return False
     
     def _calculate_distance(self, point1: Tuple[float, float], point2: Tuple[float, float], is_wgs84: bool = True) -> float:
