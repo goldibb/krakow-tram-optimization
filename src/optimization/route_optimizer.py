@@ -3,7 +3,6 @@ from typing import List, Tuple, Dict, Optional
 import random
 from dataclasses import dataclass
 import logging
-from .density_calculator import DensityCalculator
 import geopandas as gpd
 from shapely.geometry import LineString, Point, Polygon
 import networkx as nx
@@ -335,13 +334,46 @@ class RouteOptimizer:
         
         logger.info(f"Rozpoczynam {max_iterations} iteracji optymalizacji...")
         
+        # Pobierz listę wszystkich dostępnych przystanków
+        if self.stops_df is not None:
+            valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
+        else:
+            logger.warning("Brak danych o przystankach - używam punktów grafu")
+            # Konwertuj przykładowe węzły grafu do WGS84 jako backup
+            sample_nodes = list(self.street_graph.nodes())[:100]  # Tylko pierwsze 100 dla wydajności
+            valid_stops = []
+            for node in sample_nodes:
+                try:
+                    node_gdf = gpd.GeoDataFrame(
+                        geometry=[Point(node[0], node[1])], crs="EPSG:2180"
+                    ).to_crs(epsg=4326)
+                    valid_stops.append((node_gdf.geometry.y[0], node_gdf.geometry.x[0]))
+                except:
+                    continue
+        
         for iteration in range(max_iterations):
             # Logowanie postępu co 100 iteracji
             if iteration % 100 == 0:
                 logger.info(f"Iteracja {iteration}/{max_iterations}, najlepszy wynik: {best_score:.3f}")
             
-            # Generowanie losowej trasy
-            route = self._generate_random_route(start_point_in_graph, end_point_in_graph, num_stops)
+            # POPRAWKA: Generuj różnorodne trasy
+            if iteration % 10 == 0 or len(valid_stops) < 10:
+                # Co 10. iteracja: używaj oryginalnych punktów (deterministic baseline)
+                route = self._generate_random_route(start_point_in_graph, end_point_in_graph, num_stops)
+            else:
+                # Pozostałe iteracje: używaj losowych punktów startowych/końcowych z przystanków
+                random_start = random.choice(valid_stops)
+                random_end = random.choice(valid_stops)
+                
+                # Znajdź punkty w grafie dla losowych przystanków
+                random_start_in_graph = self._find_nearest_point_in_graph(random_start)
+                random_end_in_graph = self._find_nearest_point_in_graph(random_end)
+                
+                if random_start_in_graph and random_end_in_graph:
+                    route = self._generate_random_route(random_start_in_graph, random_end_in_graph, num_stops)
+                else:
+                    # Fallback do oryginalnych punktów
+                    route = self._generate_random_route(start_point_in_graph, end_point_in_graph, num_stops)
             
             # Obliczanie oceny trasy
             density_score = self.calculate_density_score(route)
