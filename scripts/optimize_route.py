@@ -75,9 +75,19 @@ def main():
     # Uruchomienie optymalizacji
     logger.info("Rozpoczynam optymalizację...")
     
-    # Wybór punktów startowego i końcowego
-    start_point = (50.0647, 19.9450)  # Rondo Mogilskie
-    end_point = (50.0720, 19.9570)    # Plac Centralny
+    # Wybór punktów startowego i końcowego z najgęściej zaludnionych przystanków
+    # Użyjemy TOP przystanków znalezionych przez optymalizator
+    top_density_stops = optimizer._find_top_density_stops(top_n=5)
+    
+    start_point = top_density_stops[0]  # Najgęściej zaludniony przystanek
+    end_point = top_density_stops[4]    # Piąty najgęściej zaludniony przystanek
+    
+    logger.info(f"Punkt startowy: {start_point}")
+    logger.info(f"Punkt końcowy: {end_point}")
+    logger.info(f"Liczba budynków: {len(buildings_df)}")
+    logger.info(f"Liczba ulic: {len(streets_df)}")
+    logger.info(f"Liczba przystanków: {len(stops_df)}")
+    logger.info(f"Liczba linii: {len(lines_df)}")
     
     best_route, best_score = optimizer.optimize_route(
         start_point=start_point,
@@ -103,9 +113,6 @@ def main():
         max(lat for lat, lon in best_route)
     )
     
-    # Tworzenie mapy gęstości
-    density_map = visualizer.create_density_map(best_route)
-    
     # Wizualizacja wyników
     logger.info("Generowanie wizualizacji...")
     
@@ -113,15 +120,15 @@ def main():
     results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'results')
     os.makedirs(results_dir, exist_ok=True)
     
-    m = visualizer.plot_optimization_results(
-        best_route=best_route,
-        density_map=density_map,
-        bounds=bounds,
-        score=best_score,
-        save_path=os.path.join(results_dir, "optimized_route.html")
-    )
+    # Tworzenie mapy
+    m = visualizer.create_base_map()
+    visualizer.plot_route(best_route, m, route_name="Zoptymalizowana trasa", color='red')
     
-    logger.info(f"Wizualizacja zapisana w {os.path.join(results_dir, 'optimized_route.html')}")
+    # Zapisanie mapy
+    map_path = os.path.join(results_dir, "optimized_route.html")
+    m.save(map_path)
+    
+    logger.info(f"Wizualizacja zapisana w {map_path}")
 
 if __name__ == "__main__":
     main() 

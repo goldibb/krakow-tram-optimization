@@ -119,104 +119,83 @@ class RouteOptimizer:
     def _create_street_graph(self) -> nx.Graph:
         """
         Tworzy graf sieci ulic na podstawie danych OSM.
-        Inteligentnie ogranicza obszar do rejonów istotnych dla nowej linii tramwajowej.
+        Skupia się tylko na najgęściej zaludnionych obszarach dla maksymalnej efektywności.
         
         Returns:
             nx.Graph: Graf sieci ulic
         """
         G = nx.Graph()
         
-        # INTELIGENTNE OGRANICZENIE OBSZARU
-        logger.info("Ograniczanie obszaru do rejonów istotnych dla tramwaju...")
+        # SZYBKIE WYSZUKIWANIE NAJGĘŚCIEJ ZALUDNIONYCH OBSZARÓW
+        logger.info("Wyszukiwanie najgęściej zaludnionych obszarów...")
         
-        if self.stops_df is not None and len(self.stops_df) > 0:
-            # 1. Obszary wokół istniejących przystanków tramwajowych (1km bufor)
-            stops_buffer_distance = 1000  # 1km w metrach
-            stops_buffers = self.stops_projected.geometry.buffer(stops_buffer_distance)
-            stops_union = unary_union(stops_buffers)
-            logger.info(f"Utworzono bufor 1km wokół {len(self.stops_df)} przystanków")
+        if self.stops_df is not None and len(self.stops_df) > 0 and len(self.buildings_projected) > 0:
+            # 1. Znajdź TOP 5 najgęściej zaludnionych przystanków
+            top_density_stops = self._find_top_density_stops(top_n=5)
+            logger.info(f"Znaleziono {len(top_density_stops)} przystanków o najwyższej gęstości zaludnienia")
             
-            # 2. Obszary o wysokiej gęstości zabudowy
-            if len(self.buildings_projected) > 0:
-                # Oblicz gęstość zabudowy w siatce 500x500m
-                buildings_bounds = self.buildings_projected.total_bounds
-                grid_size = 500  # 500m siatka
+            # 2. Utwórz bufor 800m wokół TOP przystanków
+            buffer_distance = 800  # 800m - zasięg pieszej dostępności
+            relevant_areas = []
+            
+            for stop_coords in top_density_stops:
+                # Konwertuj do EPSG:2180
+                stop_gdf = gpd.GeoDataFrame(
+                    geometry=[Point(stop_coords[1], stop_coords[0])],  # lon, lat
+                    crs="EPSG:4326"
+                ).to_crs(epsg=2180)
                 
-                high_density_areas = []
-                min_x, min_y, max_x, max_y = buildings_bounds
-                
-                for x in range(int(min_x), int(max_x), grid_size):
-                    for y in range(int(min_y), int(max_y), grid_size):
-                        # Prostokąt siatki
-                        from shapely.geometry import box
-                        grid_cell = box(x, y, x + grid_size, y + grid_size)
-                        
-                        # Znajdź budynki w tym obszarze
-                        buildings_in_cell = self.buildings_projected[
-                            self.buildings_projected.geometry.intersects(grid_cell)
-                        ]
-                        
-                        # Jeśli gęstość > próg, dodaj do obszarów zainteresowania
-                        if len(buildings_in_cell) > 10:  # próg: min 10 budynków na 500x500m
-                            high_density_areas.append(grid_cell)
-                
-                if high_density_areas:
-                    density_union = unary_union(high_density_areas)
-                    # Połącz obszary przystanków i gęstej zabudowy
-                    relevant_area = unary_union([stops_union, density_union])
-                    logger.info(f"Znaleziono {len(high_density_areas)} obszarów wysokiej gęstości zabudowy")
-                else:
-                    relevant_area = stops_union
-                    logger.info("Brak obszarów wysokiej gęstości - używam tylko buforów przystanków")
+                stop_buffer = stop_gdf.geometry.buffer(buffer_distance)[0]
+                relevant_areas.append(stop_buffer)
+            
+            # 3. Połącz wszystkie obszary
+            if relevant_areas:
+                relevant_area = unary_union(relevant_areas)
+                logger.info("Utworzono bufor 800m wokół najgęstszych przystanków")
             else:
-                relevant_area = stops_union
-                logger.info("Brak danych o budynkach - używam tylko buforów przystanków")
+                # Fallback - bufor wokół wszystkich przystanków ale mniejszy
+                stops_buffers = self.stops_projected.geometry.buffer(500)
+                relevant_area = unary_union(stops_buffers.head(10))  # tylko 10 pierwszych
+                logger.info("Fallback: bufor 500m wokół 10 pierwszych przystanków")
             
-            # 3. Filtruj ulice do istotnych obszarów
-            logger.info("Filtrowanie ulic do istotnych obszarów...")
+            # 4. Filtruj ulice do wybranych obszarów
+            logger.info("Filtrowanie ulic do wybranych obszarów...")
             streets_in_relevant_area = self.streets_projected[
                 self.streets_projected.geometry.intersects(relevant_area)
             ]
             
             logger.info(f"Ograniczono z {len(self.streets_projected)} do {len(streets_in_relevant_area)} ulic")
             
-            # Jeśli nadal za dużo, weź próbkę
-            if len(streets_in_relevant_area) > 5000:
-                streets_filtered = streets_in_relevant_area.sample(n=5000, random_state=42)
-                logger.info(f"Dodatkowo ograniczono do {len(streets_filtered)} ulic (próbka)")
+            # 5. Jeśli nadal za dużo, weź próbkę z priorytetem dla głównych dróg
+            if len(streets_in_relevant_area) > 2000:
+                # Próbka z preferencją dla większych ulic (jeśli mają większą powierzchnię)
+                streets_filtered = streets_in_relevant_area.sample(n=2000, random_state=42)
+                logger.info(f"Ograniczono do {len(streets_filtered)} ulic (próbka)")
             else:
                 streets_filtered = streets_in_relevant_area
                 
         else:
-            # Fallback - brak przystanków
-            logger.warning("Brak danych o przystankach - używam ograniczonej próbki ulic")
-            streets_filtered = self.streets_projected.sample(n=min(2000, len(self.streets_projected)), random_state=42)
+            # Ultra-szybki fallback
+            logger.warning("Szybki tryb: używam tylko 1500 losowych ulic")
+            streets_filtered = self.streets_projected.sample(n=min(1500, len(self.streets_projected)), random_state=42)
         
-        # Sprawdź czy mamy jakieś ulice
-        if len(streets_filtered) == 0:
-            logger.error("Brak ulic po filtrowaniu! Używam próbki 1000 ulic.")
-            streets_filtered = self.streets_projected.head(1000)
+        logger.info(f"Finalna liczba ulic: {len(streets_filtered)}")
         
-        logger.info(f"Finalna liczba ulic do przetworzenia: {len(streets_filtered)}")
+        # Dodawanie węzłów (skrzyżowania) - tylko jeśli mamy rozsądną liczbę ulic
+        if len(streets_filtered) > 5000:
+            logger.warning(f"Nadal za dużo ulic ({len(streets_filtered)}), ograniczam do 1000")
+            streets_filtered = streets_filtered.head(1000)
         
-        # Dodawanie węzłów (skrzyżowania)
         for idx, row in streets_filtered.iterrows():
             coords = list(row.geometry.coords)
             for i in range(len(coords) - 1):
-                # coords są już w układzie EPSG:2180 (x, y)
-                point1_epsg2180 = coords[i]  # (x, y) w EPSG:2180
-                point2_epsg2180 = coords[i + 1]  # (x, y) w EPSG:2180
+                point1_epsg2180 = coords[i]
+                point2_epsg2180 = coords[i + 1]
                 
-                # Obliczanie odległości używając bezpiecznej metody z EPSG:2180
                 dist = self._calculate_distance(point1_epsg2180, point2_epsg2180, is_wgs84=False)
                 
-                # Dodaj krawędź tylko jeśli odległość jest prawidłowa
                 if dist > 0:
-                    G.add_edge(
-                        point1_epsg2180,
-                        point2_epsg2180,
-                        weight=dist
-                    )
+                    G.add_edge(point1_epsg2180, point2_epsg2180, weight=dist)
         
         return G
     
@@ -330,7 +309,7 @@ class RouteOptimizer:
         max_possible_distance = self.constraints.max_distance_between_stops * (len(route) - 1)
         return 1 - (total_distance / max_possible_distance)
     
-    def _find_nearest_point_in_graph(self, point: Tuple[float, float], max_distance: float = 100) -> Optional[Tuple[float, float]]:
+    def _find_nearest_point_in_graph(self, point: Tuple[float, float], max_distance: float = 1000) -> Optional[Tuple[float, float]]:
         """
         Znajduje najbliższy punkt w grafie sieci ulic - ZOPTYMALIZOWANA WERSJA.
         
@@ -417,8 +396,8 @@ class RouteOptimizer:
         # Znalezienie najbliższych punktów w sieci ulic
         logger.info("Szukam najbliższych punktów w grafie...")
         start_time = time.time()
-        start_point_in_graph = self._find_nearest_point_in_graph(start_point)
-        end_point_in_graph = self._find_nearest_point_in_graph(end_point)
+        start_point_in_graph = self._find_nearest_point_in_graph(start_point, max_distance=1000)
+        end_point_in_graph = self._find_nearest_point_in_graph(end_point, max_distance=1000)
         logger.info(f"Znaleziono punkty w grafie w {time.time() - start_time:.2f}s")
         
         if start_point_in_graph is None or end_point_in_graph is None:
@@ -1028,4 +1007,51 @@ class RouteOptimizer:
         
         # Utwórz KDTree dla szybkiego wyszukiwania
         self.spatial_index = cKDTree(self.graph_nodes_coords)
-        logger.info(f"Spatial index utworzony dla {len(self.graph_nodes_list)} węzłów") 
+        logger.info(f"Spatial index utworzony dla {len(self.graph_nodes_list)} węzłów")
+
+    def _find_top_density_stops(self, top_n: int = 5) -> List[Tuple[float, float]]:
+        """
+        Znajduje przystanki o najwyższej gęstości zabudowy w promieniu 300m.
+        
+        Args:
+            top_n: Liczba przystanków do zwrócenia
+            
+        Returns:
+            List[Tuple[float, float]]: Lista współrzędnych (lat, lon) najlepszych przystanków
+        """
+        logger.info(f"Obliczanie gęstości zabudowy dla {len(self.stops_df)} przystanków...")
+        
+        stop_densities = []
+        radius = 300  # 300m promień
+        
+        for idx, stop in self.stops_df.iterrows():
+            # Konwertuj przystanek do EPSG:2180
+            stop_projected = gpd.GeoDataFrame(
+                geometry=[stop.geometry],
+                crs="EPSG:4326"
+            ).to_crs(epsg=2180).geometry[0]
+            
+            # Znajdź budynki w promieniu 300m
+            buildings_nearby = self.buildings_projected[
+                self.buildings_projected.geometry.distance(stop_projected) <= radius
+            ]
+            
+            # Oblicz gęstość jako liczba budynków / powierzchnia koła
+            density = len(buildings_nearby) / (np.pi * radius**2) * 1000000  # na km²
+            
+            stop_densities.append({
+                'coords': (stop.geometry.y, stop.geometry.x),  # lat, lon
+                'density': density,
+                'buildings_count': len(buildings_nearby)
+            })
+        
+        # Sortuj według gęstości
+        stop_densities.sort(key=lambda x: x['density'], reverse=True)
+        
+        # Loguj TOP przystanki
+        logger.info("TOP przystanki według gęstości zabudowy:")
+        for i, stop in enumerate(stop_densities[:top_n]):
+            logger.info(f"  {i+1}. Gęstość: {stop['density']:.1f} budynków/km², "
+                       f"Budynki: {stop['buildings_count']}, Coords: {stop['coords']}")
+        
+        return [stop['coords'] for stop in stop_densities[:top_n]] 
