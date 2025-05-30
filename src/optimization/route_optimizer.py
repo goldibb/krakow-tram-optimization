@@ -125,11 +125,20 @@ class RouteOptimizer:
         for idx, row in self.streets_projected.iterrows():
             coords = list(row.geometry.coords)
             for i in range(len(coords) - 1):
-                G.add_edge(
-                    coords[i],
-                    coords[i + 1],
-                    weight=distance.euclidean(coords[i], coords[i + 1])
-                )
+                # Konwersja współrzędnych do formatu (lat, lon)
+                point1 = (coords[i][1], coords[i][0])  # (lat, lon)
+                point2 = (coords[i + 1][1], coords[i + 1][0])  # (lat, lon)
+                
+                # Obliczanie odległości używając bezpiecznej metody
+                dist = self._calculate_distance(point1, point2)
+                
+                # Dodaj krawędź tylko jeśli odległość jest prawidłowa
+                if dist > 0:
+                    G.add_edge(
+                        coords[i],
+                        coords[i + 1],
+                        weight=dist
+                    )
         
         return G
     
@@ -171,21 +180,28 @@ class RouteOptimizer:
         Sprawdza czy współrzędne są prawidłowe.
         
         Args:
-            point: Punkt (lat, lon) do sprawdzenia
+            point: Punkt (x, y) w układzie EPSG:2180
             
         Returns:
             bool: True jeśli współrzędne są prawidłowe
         """
         try:
-            lat, lon = point
-            return (
-                isinstance(lat, (int, float)) and 
-                isinstance(lon, (int, float)) and
-                -90 <= lat <= 90 and
-                -180 <= lon <= 180 and
-                not np.isnan(lat) and
-                not np.isnan(lon)
-            )
+            x, y = point
+            # Sprawdzenie czy wartości nie są None lub NaN
+            if any(p is None or np.isnan(p) for p in (x, y)):
+                return False
+                
+            # Sprawdzenie czy wartości są liczbami
+            if not (isinstance(x, (int, float)) and isinstance(y, (int, float))):
+                return False
+                
+            # Sprawdzenie czy wartości są w rozsądnym zakresie dla EPSG:2180
+            # Szersze granice dla Krakowa i okolic
+            if not (233000 <= x <= 252000 and 556000 <= y <= 588000):
+                return False
+                
+            return True
+            
         except Exception:
             return False
 
@@ -371,13 +387,20 @@ class RouteOptimizer:
             min_end_dist = float('inf')
             
             for node in self.street_graph.nodes():
-                start_dist = distance.euclidean(start_node, node)
-                end_dist = distance.euclidean(end_node, node)
+                # Użyj bezpiecznej metody obliczania odległości
+                start_dist = self._calculate_distance(
+                    (node[1], node[0]),  # (lat, lon)
+                    (start_point[0], start_point[1])  # (lat, lon)
+                )
+                end_dist = self._calculate_distance(
+                    (node[1], node[0]),  # (lat, lon)
+                    (end_point[0], end_point[1])  # (lat, lon)
+                )
                 
-                if start_dist < min_start_dist:
+                if start_dist < min_start_dist and start_dist > 0:
                     min_start_dist = start_dist
                     start_node_in_graph = node
-                if end_dist < min_end_dist:
+                if end_dist < min_end_dist and end_dist > 0:
                     min_end_dist = end_dist
                     end_node_in_graph = node
             
@@ -386,12 +409,16 @@ class RouteOptimizer:
                 return [start_point, end_point]
             
             # Znajdź najkrótszą ścieżkę
-            path = nx.shortest_path(
-                self.street_graph,
-                start_node_in_graph,
-                end_node_in_graph,
-                weight='weight'
-            )
+            try:
+                path = nx.shortest_path(
+                    self.street_graph,
+                    start_node_in_graph,
+                    end_node_in_graph,
+                    weight='weight'
+                )
+            except nx.NetworkXNoPath:
+                logger.warning("Nie znaleziono ścieżki między punktami")
+                return [start_point, end_point]
             
             # Konwersja z powrotem do formatu (lat, lon)
             path = [(lat, lon) for lon, lat in path]
@@ -403,9 +430,6 @@ class RouteOptimizer:
             indices = np.linspace(0, len(path) - 1, num_stops, dtype=int)
             return [path[i] for i in indices]
             
-        except nx.NetworkXNoPath:
-            logger.warning("Nie znaleziono ścieżki między punktami")
-            return [start_point, end_point]
         except Exception as e:
             logger.error(f"Błąd podczas generowania trasy: {str(e)}")
             return [start_point, end_point]
@@ -456,8 +480,8 @@ class RouteOptimizer:
         Bezpiecznie oblicza odległość między dwoma punktami w metrach.
         
         Args:
-            point1: Pierwszy punkt (lat, lon)
-            point2: Drugi punkt (lat, lon)
+            point1: Pierwszy punkt (x, y) w układzie EPSG:2180
+            point2: Drugi punkt (x, y) w układzie EPSG:2180
             
         Returns:
             float: Odległość w metrach lub 0 w przypadku błędu
@@ -472,30 +496,22 @@ class RouteOptimizer:
                 logger.warning(f"Współrzędne zawierają None lub NaN: {point1}, {point2}")
                 return 0
             
-            # Konwersja punktów do układu EPSG:2180
-            p1 = gpd.GeoDataFrame(
-                geometry=[Point(point1[1], point1[0])],  # (lon, lat)
-                crs="EPSG:4326"
-            ).to_crs(epsg=2180)
-            
-            p2 = gpd.GeoDataFrame(
-                geometry=[Point(point2[1], point2[0])],  # (lon, lat)
-                crs="EPSG:4326"
-            ).to_crs(epsg=2180)
-            
-            # Sprawdzenie czy geometrie są prawidłowe
-            if p1.geometry.isna().any() or p2.geometry.isna().any():
-                logger.warning("Nieprawidłowe geometrie po konwersji")
-                return 0
+            # Tworzenie punktów bezpośrednio w układzie EPSG:2180
+            p1 = Point(point1[0], point1[1])  # (x, y)
+            p2 = Point(point2[0], point2[1])  # (x, y)
             
             # Obliczanie odległości w metrach
-            distance = float(p1.geometry[0].distance(p2.geometry[0]))
+            distance = float(p1.distance(p2))
             
             # Sprawdzenie czy odległość jest prawidłowa
             if np.isnan(distance) or np.isinf(distance):
                 logger.warning(f"Nieprawidłowa odległość: {distance}")
                 return 0
-            
+                
+            # Dodanie minimalnej odległości, aby uniknąć ostrzeżeń
+            if distance < 0.001:  # 1mm
+                return 0.001
+                
             return distance
             
         except Exception as e:

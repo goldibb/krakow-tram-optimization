@@ -1,8 +1,56 @@
-geopandas==0.14.4
-geopy==2.4.1
-networkx==3.3
-numpy==1.26.4
-pandas==2.2.3
-matplotlib==3.9.2
-osmnx==2.0.3
-folium==0.19.1
+# Core
+pandas>=2.0.0
+numpy>=1.24.0
+geopandas>=0.14.0
+shapely>=2.0.0
+
+# Network analysis
+networkx>=3.2.0
+osmnx>=1.7.0
+igraph>=0.10.0
+
+# Optimization
+ortools>=9.8.0
+pulp>=2.7.0
+scipy>=1.11.0
+deap>=1.4.0
+pygad>=3.2.0
+scikit-opt>=0.6.0
+
+# Visualization  
+folium>=0.15.0
+plotly>=5.17.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Web app
+streamlit>=1.28.0
+dash>=2.14.0
+flask>=2.3.0
+
+# Utils
+tqdm>=4.66.0
+joblib>=1.3.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# DODATKOWE - kluczowe na hackathon
+overpy>=0.7.0           # Overpass API dla OSM (ważne!)
+contextily>=1.4.0       # Mapy bazowe dla wizualizacji
+scikit-learn>=1.3.0     # ML algorithms (clustering POI)
+openpyxl>=3.1.0         # Excel files (dane GUS)
+xlrd>=2.0.0             # Stare pliki Excel
+rtree>=1.0.0            # Spatial indexing (przyspiesza GIS)
+descartes>=1.1.0        # Plotting geometries
+pyproj>=3.6.0           # Coordinate transformations
+
+# Web scraping (backup for data)
+selenium>=4.15.0        # Jeśli trzeba scrapować
+lxml>=4.9.0             # XML/HTML parsing
+
+# Jupyter (do eksploracji)
+jupyter>=1.0.0
+ipykernel>=6.25.0
+
+# OPCJONALNE ale przydatne
+geopy>=2.4.0            # Geocoding
