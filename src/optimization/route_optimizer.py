@@ -333,7 +333,13 @@ class RouteOptimizer:
         best_route = None
         best_score = float('-inf')
         
-        for _ in range(max_iterations):
+        logger.info(f"Rozpoczynam {max_iterations} iteracji optymalizacji...")
+        
+        for iteration in range(max_iterations):
+            # Logowanie postępu co 100 iteracji
+            if iteration % 100 == 0:
+                logger.info(f"Iteracja {iteration}/{max_iterations}, najlepszy wynik: {best_score:.3f}")
+            
             # Generowanie losowej trasy
             route = self._generate_random_route(start_point_in_graph, end_point_in_graph, num_stops)
             
@@ -349,7 +355,9 @@ class RouteOptimizer:
             if total_score > best_score:
                 best_score = total_score
                 best_route = route
+                logger.info(f"Znaleziono lepszą trasę w iteracji {iteration}: wynik {best_score:.3f}")
                 
+        logger.info(f"Optymalizacja zakończona po {max_iterations} iteracjach. Najlepszy wynik: {best_score:.3f}")
         return best_route, best_score
     
     def _generate_random_route(
@@ -370,7 +378,7 @@ class RouteOptimizer:
             List[Tuple[float, float]]: Wygenerowana trasa
         """
         try:
-            # Znajdź najbliższe węzły w grafie
+            # Znajdź najbliższe węzły w grafie - używamy cache jeśli punkty się nie zmieniły
             start_node_in_graph = None
             end_node_in_graph = None
             min_start_dist = float('inf')
@@ -393,17 +401,32 @@ class RouteOptimizer:
                 logger.error(f"Błąd konwersji punktów do EPSG:2180: {str(e)}")
                 return [start_point, end_point]
             
+            # Optymalizacja: przerwij wyszukiwanie gdy znajdziemy bardzo blisko węzły
+            found_good_start = False
+            found_good_end = False
+            
             for node in self.street_graph.nodes():
-                # Użyj bezpośredniego obliczania odległości w EPSG:2180
-                start_dist = self._calculate_distance(start_epsg2180, node, is_wgs84=False)
-                end_dist = self._calculate_distance(end_epsg2180, node, is_wgs84=False)
+                # Jeśli już znaleźliśmy dobre węzły, nie szukaj dalej
+                if found_good_start and found_good_end:
+                    break
+                    
+                if not found_good_start:
+                    start_dist = self._calculate_distance(start_epsg2180, node, is_wgs84=False)
+                    if start_dist < min_start_dist and start_dist > 0:
+                        min_start_dist = start_dist
+                        start_node_in_graph = node
+                        # Jeśli znaleziono bardzo blisko (< 50m), to wystarczy
+                        if start_dist < 50:
+                            found_good_start = True
                 
-                if start_dist < min_start_dist and start_dist > 0:
-                    min_start_dist = start_dist
-                    start_node_in_graph = node
-                if end_dist < min_end_dist and end_dist > 0:
-                    min_end_dist = end_dist
-                    end_node_in_graph = node
+                if not found_good_end:
+                    end_dist = self._calculate_distance(end_epsg2180, node, is_wgs84=False)
+                    if end_dist < min_end_dist and end_dist > 0:
+                        min_end_dist = end_dist
+                        end_node_in_graph = node
+                        # Jeśli znaleziono bardzo blisko (< 50m), to wystarczy
+                        if end_dist < 50:
+                            found_good_end = True
             
             if start_node_in_graph is None or end_node_in_graph is None:
                 logger.error("Nie można znaleźć węzłów w grafie")
@@ -421,15 +444,43 @@ class RouteOptimizer:
                 logger.warning("Nie znaleziono ścieżki między punktami")
                 return [start_point, end_point]
             
-            # Konwersja z powrotem do formatu (lat, lon)
-            path = [(lat, lon) for lon, lat in path]
-            
-            # Wybór równomiernie rozłożonych punktów na ścieżce
+            # Optymalizacja: jeśli ścieżka jest krótka, konwertuj tylko wybrane punkty
             if len(path) <= num_stops:
-                return path
+                # Konwertuj wszystkie punkty
+                wgs84_path = []
+                for node in path:
+                    try:
+                        node_gdf = gpd.GeoDataFrame(
+                            geometry=[Point(node[0], node[1])],  # (x, y) w EPSG:2180
+                            crs="EPSG:2180"
+                        ).to_crs(epsg=4326)
+                        lat = node_gdf.geometry.y[0]
+                        lon = node_gdf.geometry.x[0]
+                        wgs84_path.append((lat, lon))
+                    except Exception as e:
+                        logger.warning(f"Błąd konwersji węzła {node} do WGS84: {str(e)}")
+                        return [start_point, end_point]
+                return wgs84_path
+            else:
+                # Wybierz równomiernie rozłożone punkty PRZED konwersją
+                indices = np.linspace(0, len(path) - 1, num_stops, dtype=int)
+                selected_nodes = [path[i] for i in indices]
                 
-            indices = np.linspace(0, len(path) - 1, num_stops, dtype=int)
-            return [path[i] for i in indices]
+                # Konwertuj tylko wybrane punkty
+                wgs84_path = []
+                for node in selected_nodes:
+                    try:
+                        node_gdf = gpd.GeoDataFrame(
+                            geometry=[Point(node[0], node[1])],  # (x, y) w EPSG:2180
+                            crs="EPSG:2180"
+                        ).to_crs(epsg=4326)
+                        lat = node_gdf.geometry.y[0]
+                        lon = node_gdf.geometry.x[0]
+                        wgs84_path.append((lat, lon))
+                    except Exception as e:
+                        logger.warning(f"Błąd konwersji węzła {node} do WGS84: {str(e)}")
+                        return [start_point, end_point]
+                return wgs84_path
             
         except Exception as e:
             logger.error(f"Błąd podczas generowania trasy: {str(e)}")
@@ -655,6 +706,7 @@ class RouteOptimizer:
     def _create_initial_population(self) -> List[List[Tuple[float, float]]]:
         """Tworzy początkową populację tras."""
         population = []
+        # Używamy oryginalnego stops_df w WGS84, nie projected
         valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
         
         logger.info(f"Liczba dostępnych przystanków: {len(valid_stops)}")
@@ -753,6 +805,7 @@ class RouteOptimizer:
         mutated_route = route.copy()
         mutation_type = random.choice(['swap', 'replace'])
         
+        # Używamy oryginalnego stops_df w WGS84, nie projected
         valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
         
         if mutation_type == 'swap':
