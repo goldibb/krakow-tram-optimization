@@ -119,51 +119,85 @@ class RouteOptimizer:
     def _create_street_graph(self) -> nx.Graph:
         """
         Tworzy graf sieci ulic na podstawie danych OSM.
+        Inteligentnie ogranicza obszar do rejonów istotnych dla nowej linii tramwajowej.
         
         Returns:
             nx.Graph: Graf sieci ulic
         """
         G = nx.Graph()
         
-        # OPTYMALIZACJA: Ograniczenie do obszaru zainteresowania
-        if self.stops_df is not None:
-            # Oblicz granice na podstawie przystanków z buforem
-            stops_bounds = self.stops_df.total_bounds
-            buffer = 0.02  # zwiększony bufor do ~2km w stopniach
-            min_lon, min_lat = stops_bounds[0] - buffer, stops_bounds[1] - buffer
-            max_lon, max_lat = stops_bounds[2] + buffer, stops_bounds[3] + buffer
+        # INTELIGENTNE OGRANICZENIE OBSZARU
+        logger.info("Ograniczanie obszaru do rejonów istotnych dla tramwaju...")
+        
+        if self.stops_df is not None and len(self.stops_df) > 0:
+            # 1. Obszary wokół istniejących przystanków tramwajowych (1km bufor)
+            stops_buffer_distance = 1000  # 1km w metrach
+            stops_buffers = self.stops_projected.geometry.buffer(stops_buffer_distance)
+            stops_union = unary_union(stops_buffers)
+            logger.info(f"Utworzono bufor 1km wokół {len(self.stops_df)} przystanków")
             
-            logger.info(f"Granice przystanków: lat {min_lat:.4f}-{max_lat:.4f}, lon {min_lon:.4f}-{max_lon:.4f}")
+            # 2. Obszary o wysokiej gęstości zabudowy
+            if len(self.buildings_projected) > 0:
+                # Oblicz gęstość zabudowy w siatce 500x500m
+                buildings_bounds = self.buildings_projected.total_bounds
+                grid_size = 500  # 500m siatka
+                
+                high_density_areas = []
+                min_x, min_y, max_x, max_y = buildings_bounds
+                
+                for x in range(int(min_x), int(max_x), grid_size):
+                    for y in range(int(min_y), int(max_y), grid_size):
+                        # Prostokąt siatki
+                        from shapely.geometry import box
+                        grid_cell = box(x, y, x + grid_size, y + grid_size)
+                        
+                        # Znajdź budynki w tym obszarze
+                        buildings_in_cell = self.buildings_projected[
+                            self.buildings_projected.geometry.intersects(grid_cell)
+                        ]
+                        
+                        # Jeśli gęstość > próg, dodaj do obszarów zainteresowania
+                        if len(buildings_in_cell) > 10:  # próg: min 10 budynków na 500x500m
+                            high_density_areas.append(grid_cell)
+                
+                if high_density_areas:
+                    density_union = unary_union(high_density_areas)
+                    # Połącz obszary przystanków i gęstej zabudowy
+                    relevant_area = unary_union([stops_union, density_union])
+                    logger.info(f"Znaleziono {len(high_density_areas)} obszarów wysokiej gęstości zabudowy")
+                else:
+                    relevant_area = stops_union
+                    logger.info("Brak obszarów wysokiej gęstości - używam tylko buforów przystanków")
+            else:
+                relevant_area = stops_union
+                logger.info("Brak danych o budynkach - używam tylko buforów przystanków")
             
-            # Konwertuj granice do EPSG:2180 dla filtrowania
-            corners_gdf = gpd.GeoDataFrame(
-                geometry=[
-                    Point(min_lon, min_lat),
-                    Point(max_lon, max_lat)
-                ],
-                crs="EPSG:4326"
-            ).to_crs(epsg=2180)
-            
-            min_x, min_y = corners_gdf.geometry.x[0], corners_gdf.geometry.y[0]
-            max_x, max_y = corners_gdf.geometry.x[1], corners_gdf.geometry.y[1]
-            
-            # Filtruj ulice używając intersects z bounding box
-            from shapely.geometry import box
-            bbox = box(min_x, min_y, max_x, max_y)
-            streets_filtered = self.streets_projected[
-                self.streets_projected.geometry.intersects(bbox)
+            # 3. Filtruj ulice do istotnych obszarów
+            logger.info("Filtrowanie ulic do istotnych obszarów...")
+            streets_in_relevant_area = self.streets_projected[
+                self.streets_projected.geometry.intersects(relevant_area)
             ]
             
-            logger.info(f"Ograniczono z {len(self.streets_projected)} do {len(streets_filtered)} ulic")
+            logger.info(f"Ograniczono z {len(self.streets_projected)} do {len(streets_in_relevant_area)} ulic")
+            
+            # Jeśli nadal za dużo, weź próbkę
+            if len(streets_in_relevant_area) > 5000:
+                streets_filtered = streets_in_relevant_area.sample(n=5000, random_state=42)
+                logger.info(f"Dodatkowo ograniczono do {len(streets_filtered)} ulic (próbka)")
+            else:
+                streets_filtered = streets_in_relevant_area
+                
         else:
-            # Jeśli nie ma przystanków, użyj wszystkich ulic (ale ograniczonych dla wydajności)
-            streets_filtered = self.streets_projected.head(50000)  # Ograniczenie do 50k ulic
-            logger.info(f"Brak przystanków - ograniczam do {len(streets_filtered)} ulic")
+            # Fallback - brak przystanków
+            logger.warning("Brak danych o przystankach - używam ograniczonej próbki ulic")
+            streets_filtered = self.streets_projected.sample(n=min(2000, len(self.streets_projected)), random_state=42)
         
         # Sprawdź czy mamy jakieś ulice
         if len(streets_filtered) == 0:
-            logger.warning("Brak ulic w obszarze zainteresowania! Używam wszystkich ulic.")
-            streets_filtered = self.streets_projected.head(10000)  # Backup do 10k ulic
+            logger.error("Brak ulic po filtrowaniu! Używam próbki 1000 ulic.")
+            streets_filtered = self.streets_projected.head(1000)
+        
+        logger.info(f"Finalna liczba ulic do przetworzenia: {len(streets_filtered)}")
         
         # Dodawanie węzłów (skrzyżowania)
         for idx, row in streets_filtered.iterrows():
