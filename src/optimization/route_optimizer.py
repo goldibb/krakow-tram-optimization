@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RouteConstraints:
     min_distance_between_stops: float = 300  # minimalna odległość między przystankami w metrach
-    max_distance_between_stops: float = 1000  # maksymalna odległość między przystankami w metrach
+    max_distance_between_stops: float = 800  # maksymalna odległość między przystankami w metrach
     max_angle: float = 45  # maksymalny kąt zakrętu w stopniach
     min_route_length: int = 5  # minimalna liczba przystanków
     max_route_length: int = 20  # maksymalna liczba przystanków
@@ -59,8 +59,6 @@ class RouteOptimizer:
         generations: int = 50,
         mutation_rate: float = 0.1,
         crossover_rate: float = 0.8,
-        min_stop_distance: float = 300,  # minimalna odległość między przystankami w metrach
-        max_stop_distance: float = 800,  # maksymalna odległość między przystankami w metrach
         population_weight: float = 0.7,  # waga dla kryterium gęstości zaludnienia
         distance_weight: float = 0.3,    # waga dla kryterium odległości
     ):
@@ -77,8 +75,6 @@ class RouteOptimizer:
             generations: Liczba pokoleń
             mutation_rate: Współczynnik mutacji
             crossover_rate: Współczynnik krzyżowania
-            min_stop_distance: Minimalna odległość między przystankami w metrach
-            max_stop_distance: Maksymalna odległość między przystankami w metrach
             population_weight: Waga dla kryterium gęstości zaludnienia
             distance_weight: Waga dla kryterium odległości
         """
@@ -91,8 +87,6 @@ class RouteOptimizer:
         self.generations = generations
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
-        self.min_stop_distance = min_stop_distance
-        self.max_stop_distance = max_stop_distance
         self.population_weight = population_weight
         self.distance_weight = distance_weight
         
@@ -240,15 +234,15 @@ class RouteOptimizer:
             if dist == 0:  # Błąd podczas obliczania odległości
                 return 0
                 
-            if dist < self.min_stop_distance:
+            if dist < self.constraints.min_distance_between_stops:
                 return 0  # Kara za zbyt małą odległość
-            if dist > self.max_stop_distance:
+            if dist > self.constraints.max_distance_between_stops:
                 return 0  # Kara za zbyt dużą odległość
                 
             total_distance += dist
             
         # Normalizacja wyniku (im mniejsza odległość, tym lepszy wynik)
-        max_possible_distance = self.max_stop_distance * (len(route) - 1)
+        max_possible_distance = self.constraints.max_distance_between_stops * (len(route) - 1)
         return 1 - (total_distance / max_possible_distance)
     
     def _find_nearest_point_in_graph(self, point: Tuple[float, float], max_distance: float = 100) -> Optional[Tuple[float, float]]:
@@ -689,7 +683,7 @@ class RouteOptimizer:
             for i in range(len(route) - 1):
                 dist = self._calculate_distance(route[i], route[i + 1], is_wgs84=True)
                 if not is_simplified:
-                    if not (self.min_stop_distance <= dist <= self.max_stop_distance):
+                    if not (self.constraints.min_distance_between_stops <= dist <= self.constraints.max_distance_between_stops):
                         logger.debug(f"Nieprawidłowa odległość między przystankami: {dist}m")
                         return False
                 else:
