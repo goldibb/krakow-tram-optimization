@@ -1,7 +1,7 @@
 import numpy as np
 import geopandas as gpd
 from shapely.geometry import Point, Polygon
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -67,29 +67,33 @@ class DensityCalculator:
         densities = [self.calculate_density_at_point(point) for point in route_points]
         return np.mean(densities)
     
-    def get_density_map(self, grid_size: int = 100) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
+    def get_density_map(self, grid_size: float = 0.001, bounds: Optional[Tuple[float, float, float, float]] = None) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
         """
-        Tworzy mapę gęstości zabudowy dla całego obszaru.
+        Tworzy mapę gęstości zabudowy dla całego obszaru lub podanego obszaru.
         
         Args:
-            grid_size (int): Liczba punktów w siatce w każdym wymiarze
+            grid_size (float): Rozmiar siatki w stopniach
+            bounds (Optional[Tuple[float, float, float, float]]): Granice obszaru (min_lon, min_lat, max_lon, max_lat)
             
         Returns:
             Tuple[np.ndarray, Tuple[float, float, float, float]]: 
                 - Mapa gęstości zabudowy
                 - Granice obszaru (min_lon, min_lat, max_lon, max_lat)
         """
-        bounds = self.buildings_df.total_bounds
-        min_lon, min_lat, max_lon, max_lat = bounds
+        if bounds is not None:
+            min_lon, min_lat, max_lon, max_lat = bounds
+        else:
+            total_bounds = self.buildings_df.total_bounds
+            min_lon, min_lat, max_lon, max_lat = total_bounds
         
         # Tworzenie siatki punktów
-        lons = np.linspace(min_lon, max_lon, grid_size)
-        lats = np.linspace(min_lat, max_lat, grid_size)
+        lons = np.arange(min_lon, max_lon, grid_size)
+        lats = np.arange(min_lat, max_lat, grid_size)
         
-        density_map = np.zeros((grid_size, grid_size))
+        density_map = np.zeros((len(lats), len(lons)))
         
         for i, lat in enumerate(lats):
             for j, lon in enumerate(lons):
                 density_map[i, j] = self.calculate_density_at_point((lat, lon))
                 
-        return density_map, bounds 
+        return density_map, (min_lon, min_lat, max_lon, max_lat) 

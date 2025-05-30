@@ -10,20 +10,22 @@ from shapely.ops import unary_union
 from scipy.spatial import distance
 from scipy.spatial import cKDTree
 import time
+from .density_calculator import DensityCalculator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 @dataclass
 class RouteConstraints:
-    min_distance_between_stops: float = 300  # minimalna odległość między przystankami w metrach
-    max_distance_between_stops: float = 800  # maksymalna odległość między przystankami w metrach
-    max_angle: float = 45  # maksymalny kąt zakrętu w stopniach
-    min_route_length: int = 5  # minimalna liczba przystanków
+    min_distance_between_stops: float = 200  # minimalna odległość między przystankami w metrach
+    max_distance_between_stops: float = 1500  # maksymalna odległość między przystankami w metrach
+    max_angle: float = 60  # maksymalny kąt zakrętu w stopniach
+    min_route_length: int = 3  # minimalna liczba przystanków
     max_route_length: int = 20  # maksymalna liczba przystanków
-    min_total_length: float = 2000  # minimalna długość całkowita trasy w metrach
-    max_total_length: float = 10000  # maksymalna długość całkowita trasy w metrach
-    min_distance_from_buildings: float = 5  # minimalna odległość od budynków w metrach
+    min_total_length: float = 1000  # minimalna długość całkowita trasy w metrach
+    max_total_length: float = 15000  # maksymalna długość całkowita trasy w metrach
+    min_distance_from_buildings: float = 3  # minimalna odległość od budynków w metrach
+    angle_weight: float = 0.1  # waga dla kryterium minimalizacji kątów
 
 class RouteOptimizer:
     def _prepare_existing_lines(self) -> List[LineString]:
@@ -62,7 +64,8 @@ class RouteOptimizer:
         mutation_rate: float = 0.1,
         crossover_rate: float = 0.8,
         population_weight: float = 0.7,  # waga dla kryterium gęstości zaludnienia
-        distance_weight: float = 0.3,    # waga dla kryterium odległości
+        distance_weight: float = 0.2,    # waga dla kryterium odległości
+        angle_weight: float = 0.1,       # waga dla kryterium minimalizacji kątów
     ):
         """
         Inicjalizacja optymalizatora tras.
@@ -79,6 +82,7 @@ class RouteOptimizer:
             crossover_rate: Współczynnik krzyżowania
             population_weight: Waga dla kryterium gęstości zaludnienia
             distance_weight: Waga dla kryterium odległości
+            angle_weight: Waga dla kryterium minimalizacji kątów
         """
         self.buildings_df = buildings_df
         self.streets_df = streets_df
@@ -89,8 +93,12 @@ class RouteOptimizer:
         self.generations = generations
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
-        self.population_weight = population_weight
-        self.distance_weight = distance_weight
+        
+        # Normalizacja wag - muszą się sumować do 1
+        total_weight = population_weight + distance_weight + angle_weight
+        self.population_weight = population_weight / total_weight
+        self.distance_weight = distance_weight / total_weight  
+        self.angle_weight = angle_weight / total_weight
         
         # Transformacja do układu współrzędnych rzutowanych (EPSG:2180 dla Polski)
         self.buildings_projected = buildings_df.to_crs(epsg=2180)
@@ -116,6 +124,13 @@ class RouteOptimizer:
         self.existing_lines = self._prepare_existing_lines() if lines_df is not None else []
         self.buildings_buffer = self._create_buildings_buffer()
         
+        # Inicjalizacja kalkulatora gęstości
+        logger.info("Inicjalizacja kalkulatora gęstości...")
+        self.density_calculator = DensityCalculator(self.buildings_df, radius_meters=300)
+        
+        # Set do śledzenia używanych przystanków w całym systemie
+        self.used_stops = set()
+
     def _create_street_graph(self) -> nx.Graph:
         """
         Tworzy graf sieci ulic na podstawie danych OSM.
@@ -309,6 +324,120 @@ class RouteOptimizer:
         max_possible_distance = self.constraints.max_distance_between_stops * (len(route) - 1)
         return 1 - (total_distance / max_possible_distance)
     
+    def calculate_angle_score(self, route: List[Tuple[float, float]]) -> float:
+        """
+        Oblicza ocenę trasy na podstawie minimalizacji kątów zakrętu.
+        
+        Args:
+            route: Lista punktów trasy
+            
+        Returns:
+            float: Ocena trasy (0-1, wyższe wartości dla prostszych tras)
+        """
+        if len(route) < 3:
+            return 1.0  # Brak zakrętów dla tras z 2 lub mniej punktów
+            
+        total_angle_penalty = 0
+        angle_count = 0
+        
+        for i in range(1, len(route) - 1):
+            # Sprawdź czy współrzędne są prawidłowe
+            if not (self._validate_coordinates(route[i-1], is_wgs84=True) and 
+                   self._validate_coordinates(route[i], is_wgs84=True) and
+                   self._validate_coordinates(route[i+1], is_wgs84=True)):
+                continue
+                
+            angle = self._calculate_angle(route[i-1], route[i], route[i+1])
+            
+            # Kara za ostre zakręty - im większy kąt, tym większa kara
+            # Korzystamy z odchylenia od linii prostej (180°)
+            angle_deviation = abs(180 - angle)
+            angle_penalty = angle_deviation / 180.0  # normalizacja do 0-1
+            
+            total_angle_penalty += angle_penalty
+            angle_count += 1
+            
+        if angle_count == 0:
+            return 1.0
+            
+        # Średnia kara za kąty - im mniejsza, tym lepszy wynik
+        average_angle_penalty = total_angle_penalty / angle_count
+        return 1.0 - average_angle_penalty
+
+    def _find_connecting_path(self, start_point: Tuple[float, float], end_point: Tuple[float, float]) -> List[Tuple[float, float]]:
+        """
+        Znajduje ścieżkę łączącą dwa punkty przez sieć ulic używając algorytmu A*.
+        
+        Args:
+            start_point: Punkt początkowy (lat, lon) w WGS84
+            end_point: Punkt końcowy (lat, lon) w WGS84
+            
+        Returns:
+            List[Tuple[float, float]]: Lista punktów ścieżki w WGS84 lub [start_point, end_point] jeśli nie znaleziono
+        """
+        # Znajdź najbliższe węzły w grafie dla obu punktów
+        start_node = self._find_nearest_point_in_graph(start_point, max_distance=1000)
+        end_node = self._find_nearest_point_in_graph(end_point, max_distance=1000)
+        
+        if start_node is None or end_node is None:
+            logger.warning(f"Nie znaleziono węzłów w grafie dla punktów: {start_point} -> {end_point}")
+            return [start_point, end_point]
+        
+        # Konwertuj węzły do formatu używanego przez graf (EPSG:2180)
+        try:
+            start_gdf = gpd.GeoDataFrame(
+                geometry=[Point(start_node[1], start_node[0])],  # lon, lat
+                crs="EPSG:4326"
+            ).to_crs(epsg=2180)
+            start_epsg2180 = (start_gdf.geometry.x[0], start_gdf.geometry.y[0])
+            
+            end_gdf = gpd.GeoDataFrame(
+                geometry=[Point(end_node[1], end_node[0])],  # lon, lat
+                crs="EPSG:4326"
+            ).to_crs(epsg=2180)
+            end_epsg2180 = (end_gdf.geometry.x[0], end_gdf.geometry.y[0])
+            
+        except Exception as e:
+            logger.warning(f"Błąd konwersji współrzędnych: {str(e)}")
+            return [start_point, end_point]
+        
+        # Sprawdź czy węzły istnieją w grafie
+        if start_epsg2180 not in self.street_graph or end_epsg2180 not in self.street_graph:
+            logger.warning(f"Węzły nie istnieją w grafie: {start_epsg2180}, {end_epsg2180}")
+            return [start_point, end_point]
+        
+        try:
+            # Użyj A* do znajdowania najkrótszej ścieżki
+            def heuristic(node1, node2):
+                """Funkcja heurystyczna dla A* - odległość euklidesowa"""
+                return ((node1[0] - node2[0])**2 + (node1[1] - node2[1])**2)**0.5
+            
+            path = nx.astar_path(
+                self.street_graph, 
+                start_epsg2180, 
+                end_epsg2180, 
+                heuristic=heuristic,
+                weight='weight'
+            )
+            
+            # Konwertuj ścieżkę z powrotem do WGS84
+            path_wgs84 = []
+            for node in path:
+                node_gdf = gpd.GeoDataFrame(
+                    geometry=[Point(node[0], node[1])],  # x, y w EPSG:2180
+                    crs="EPSG:2180"
+                ).to_crs(epsg=4326)
+                path_wgs84.append((node_gdf.geometry.y[0], node_gdf.geometry.x[0]))  # lat, lon
+            
+            return path_wgs84
+            
+        except nx.NetworkXNoPath:
+            logger.warning(f"Nie znaleziono ścieżki między {start_point} a {end_point}")
+            return [start_point, end_point]
+        except Exception as e:
+            logger.warning(f"Błąd podczas wyszukiwania ścieżki: {str(e)}")
+            return [start_point, end_point]
+
     def _find_nearest_point_in_graph(self, point: Tuple[float, float], max_distance: float = 1000) -> Optional[Tuple[float, float]]:
         """
         Znajduje najbliższy punkt w grafie sieci ulic - ZOPTYMALIZOWANA WERSJA.
@@ -373,6 +502,102 @@ class RouteOptimizer:
             logger.warning(f"Błąd podczas wyszukiwania w spatial index: {str(e)}")
             self._nearest_point_cache[cache_key] = None
             return None
+
+    def _create_connected_route(self, stops: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """
+        Tworzy połączoną trasę z listy przystanków używając rzeczywistych dróg.
+        
+        Args:
+            stops: Lista przystanków (lat, lon) w WGS84
+            
+        Returns:
+            List[Tuple[float, float]]: Połączona trasa jako lista punktów
+        """
+        if len(stops) < 2:
+            return stops
+        
+        connected_route = [stops[0]]  # Rozpocznij od pierwszego przystanku
+        
+        for i in range(len(stops) - 1):
+            current_stop = stops[i]
+            next_stop = stops[i + 1]
+            
+            # Znajdź ścieżkę między bieżącym a następnym przystankiem
+            path = self._find_connecting_path(current_stop, next_stop)
+            
+            # Dodaj punkty ścieżki (pomijając pierwszy punkt, bo już jest w trasie)
+            if len(path) > 1:
+                connected_route.extend(path[1:])
+            else:
+                # Jeśli nie znaleziono ścieżki, po prostu połącz punkty bezpośrednio
+                connected_route.append(next_stop)
+        
+        return connected_route
+
+    def _ensure_unique_stops(self, route: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """
+        Zapewnia unikatowość przystanków w trasie i globalnie w systemie.
+        
+        Args:
+            route: Lista punktów trasy
+            
+        Returns:
+            List[Tuple[float, float]]: Trasa z unikatowymi przystankami
+        """
+        # Konwertuj przystanki do tupli z zaokrąglonymi współrzędnymi dla porównania
+        def normalize_coords(lat, lon):
+            return (round(lat, 6), round(lon, 6))
+        
+        unique_route = []
+        seen_in_route = set()
+        
+        for point in route:
+            normalized = normalize_coords(point[0], point[1])
+            
+            # Sprawdź czy punkt już występuje w tej trasie
+            if normalized in seen_in_route:
+                continue
+                
+            # Sprawdź czy punkt jest już używany w innej trasie w systemie
+            if normalized in self.used_stops:
+                # Znajdź alternatywny przystanek w pobliżu
+                alternative = self._find_alternative_stop(point, min_distance=50)
+                if alternative:
+                    normalized_alt = normalize_coords(alternative[0], alternative[1])
+                    if normalized_alt not in seen_in_route and normalized_alt not in self.used_stops:
+                        unique_route.append(alternative)
+                        seen_in_route.add(normalized_alt)
+                # Jeśli nie znaleziono alternatywy, pomijamy ten punkt
+            else:
+                unique_route.append(point)
+                seen_in_route.add(normalized)
+                
+        return unique_route
+
+    def _find_alternative_stop(self, original_stop: Tuple[float, float], min_distance: float = 50) -> Optional[Tuple[float, float]]:
+        """
+        Znajduje alternatywny przystanek w pobliżu oryginalnego.
+        
+        Args:
+            original_stop: Oryginalny przystanek (lat, lon)
+            min_distance: Minimalna odległość od oryginalnego przystanku w metrach
+            
+        Returns:
+            Optional[Tuple[float, float]]: Alternatywny przystanek lub None
+        """
+        # Sprawdź wszystkie dostępne przystanki
+        valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
+        
+        for stop in valid_stops:
+            distance = self._calculate_distance(original_stop, stop, is_wgs84=True)
+            normalized = (round(stop[0], 6), round(stop[1], 6))
+            
+            # Sprawdź czy przystanek jest w odpowiedniej odległości i nie jest używany
+            if (min_distance <= distance <= min_distance * 3 and 
+                normalized not in self.used_stops):
+                return stop
+                
+        return None
 
     def optimize_route(
         self,
@@ -825,9 +1050,13 @@ class RouteOptimizer:
         # Obliczanie odległości między przystankami
         distance_score = self.calculate_distance_score(route)
         
-        # Łączna ocena
+        # Obliczanie prostoty trasy (minimalizacja kątów zakrętu)
+        angle_score = self.calculate_angle_score(route)
+        
+        # Łączna ocena - wszystkie składniki są znormalizowane do 0-1
         score = (self.population_weight * density_score +
-                self.distance_weight * distance_score)
+                self.distance_weight * distance_score +
+                self.angle_weight * angle_score)
                 
         return score
     
@@ -852,28 +1081,57 @@ class RouteOptimizer:
                     min(self.constraints.max_route_length, len(valid_stops))
                 )
                 
-                # Wybierz losowy punkt startowy
-                start_stop = random.choice(valid_stops)
-                route = [start_stop]
+                # Wybierz losowy punkt startowy z istniejących przystanków
+                available_starts = [stop for stop in valid_stops 
+                                  if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
                 
-                # Dodaj pozostałe przystanki
-                remaining_stops = [stop for stop in valid_stops if stop != start_stop]
+                if not available_starts:
+                    logger.warning("Brak dostępnych przystanków startowych!")
+                    break
+                    
+                start_stop = random.choice(available_starts)
+                
+                # Tworzenie listy przystanków dla trasy
+                route_stops = [start_stop]
+                
+                # Dodaj pozostałe przystanki zapewniając unikatowość
+                remaining_stops = [stop for stop in valid_stops 
+                                 if stop != start_stop and 
+                                 (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
                 
                 # Jeśli nie ma wystarczająco dużo przystanków, zmniejsz długość trasy
                 if len(remaining_stops) < route_length - 1:
-                    route_length = len(remaining_stops) + 1
-                    logger.info(f"Dostosowano długość trasy do {route_length} (dostępne przystanki: {len(remaining_stops) + 1})")
+                    route_length = min(len(remaining_stops) + 1, len(available_starts))
+                    if route_length < 2:
+                        continue
                 
                 # Dodaj pozostałe przystanki
                 if len(remaining_stops) > 0:
-                    route.extend(random.sample(remaining_stops, route_length - 1))
+                    selected_stops = random.sample(remaining_stops, route_length - 1)
+                    route_stops.extend(selected_stops)
+                
+                # Zapewnij unikatowość przystanków
+                unique_stops = self._ensure_unique_stops(route_stops)
+                
+                if len(unique_stops) < 2:
+                    continue  # Potrzebujemy przynajmniej 2 przystanków
+                
+                # Utwórz połączoną trasę używając rzeczywistych dróg
+                connected_route = self._create_connected_route(unique_stops)
                 
                 # Sprawdź czy trasa jest poprawna
-                if self._is_valid_route(route, is_simplified=False):
-                    population.append(route)
-                    logger.info(f"Utworzono trasę {len(population)}/{self.population_size}")
+                if self._is_valid_route(connected_route, is_simplified=False):
+                    population.append(connected_route)
+                    
+                    # Oznacz przystanki jako używane
+                    for stop in unique_stops:
+                        normalized = (round(stop[0], 6), round(stop[1], 6))
+                        self.used_stops.add(normalized)
+                    
+                    logger.info(f"Utworzono trasę {len(population)}/{self.population_size} "
+                              f"z {len(unique_stops)} przystankami")
                 else:
-                    logger.debug(f"Trasa nie spełnia ograniczeń: {route}")
+                    logger.debug(f"Trasa nie spełnia ograniczeń")
                 
             except Exception as e:
                 logger.warning(f"Błąd podczas tworzenia trasy: {str(e)}")
@@ -884,25 +1142,38 @@ class RouteOptimizer:
             logger.warning("Nie udało się utworzyć populacji z pełnymi ograniczeniami!")
             logger.info("Tworzę uproszczoną populację...")
             
+            # Resetuj używane przystanki dla uproszczonej populacji
+            self.used_stops.clear()
+            
             # Tworzymy uproszczoną populację z minimalną liczbą tras
             simplified_population = []
             for _ in range(self.population_size):
                 try:
                     # Wybierz dwa losowe przystanki
-                    if len(valid_stops) >= 2:
-                        start = random.choice(valid_stops)
-                        end = random.choice([s for s in valid_stops if s != start])
-                        route = [start, end]
+                    available_stops = [stop for stop in valid_stops 
+                                     if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
+                    
+                    if len(available_stops) >= 2:
+                        start = random.choice(available_stops)
+                        available_stops.remove(start)
+                        end = random.choice(available_stops)
+                        
+                        # Utwórz połączoną trasę
+                        connected_route = self._create_connected_route([start, end])
                         
                         # Sprawdź czy trasa jest poprawna
-                        if self._is_valid_route(route, is_simplified=True):
-                            simplified_population.append(route)
+                        if self._is_valid_route(connected_route, is_simplified=True):
+                            simplified_population.append(connected_route)
+                            # Oznacz przystanki jako używane
+                            self.used_stops.add((round(start[0], 6), round(start[1], 6)))
+                            self.used_stops.add((round(end[0], 6), round(end[1], 6)))
                         else:
                             # Jeśli trasa nie jest poprawna, dodaj ją mimo to
-                            simplified_population.append(route)
-                    else:
-                        # Jeśli nie ma wystarczająco dużo przystanków, użyj tego samego przystanku
-                        simplified_population.append([valid_stops[0], valid_stops[0]])
+                            simplified_population.append(connected_route)
+                    elif len(available_stops) >= 1:
+                        # Jeśli nie ma wystarczająco dużo przystanków, użyj prostej trasy
+                        stop = available_stops[0]
+                        simplified_population.append([stop, stop])
                 except Exception as e:
                     logger.warning(f"Błąd podczas tworzenia uproszczonej trasy: {str(e)}")
                     continue
@@ -915,36 +1186,157 @@ class RouteOptimizer:
     def _crossover(self, parent1: List[Tuple[float, float]], 
                   parent2: List[Tuple[float, float]]) -> Tuple[List[Tuple[float, float]], 
                                                              List[Tuple[float, float]]]:
-        """Wykonuje krzyżowanie dwóch tras."""
+        """Wykonuje krzyżowanie dwóch tras zapewniając unikatowość i połączenia."""
         if random.random() > self.crossover_rate:
             return parent1, parent2
-            
-        point = random.randint(1, min(len(parent1), len(parent2)) - 1)
-        child1 = parent1[:point] + parent2[point:]
-        child2 = parent2[:point] + parent1[point:]
         
-        return child1, child2
+        # Wyodrębnij przystanki z tras
+        stops1 = self._extract_stops_from_route(parent1)
+        stops2 = self._extract_stops_from_route(parent2)
+        
+        if len(stops1) < 2 or len(stops2) < 2:
+            return parent1, parent2
+            
+        try:
+            # Punkt krzyżowania
+            point1 = random.randint(1, len(stops1) - 1)
+            point2 = random.randint(1, len(stops2) - 1)
+            
+            # Tworzenie potomstwa
+            child1_stops = stops1[:point1] + stops2[point2:]
+            child2_stops = stops2[:point2] + stops1[point1:]
+            
+            # Zapewnij unikatowość przystanków
+            child1_unique = self._ensure_unique_stops(child1_stops)
+            child2_unique = self._ensure_unique_stops(child2_stops)
+            
+            # Sprawdź czy potomstwo ma wystarczającą liczbę przystanków
+            if len(child1_unique) < 2:
+                child1_unique = stops1  # Użyj oryginalnej trasy
+            if len(child2_unique) < 2:
+                child2_unique = stops2  # Użyj oryginalnej trasy
+            
+            # Utwórz połączone trasy
+            child1_route = self._create_connected_route(child1_unique)
+            child2_route = self._create_connected_route(child2_unique)
+            
+            return child1_route, child2_route
+            
+        except Exception as e:
+            logger.warning(f"Błąd podczas krzyżowania: {str(e)}")
+            return parent1, parent2
     
     def _mutate(self, route: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Wykonuje mutację trasy."""
+        """Wykonuje mutację trasy zapewniając unikatowość i połączenia."""
         if random.random() > self.mutation_rate:
             return route
             
-        mutated_route = route.copy()
-        mutation_type = random.choice(['swap', 'replace'])
+        # Wyodrębnij przystanki z trasy (co pewną liczbę punktów, nie wszystkie punkty ścieżki)
+        route_stops = self._extract_stops_from_route(route)
+        
+        if len(route_stops) < 2:
+            return route
+            
+        mutation_type = random.choice(['swap', 'replace', 'add', 'remove'])
         
         # Używamy oryginalnego stops_df w WGS84, nie projected
         valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
         
-        if mutation_type == 'swap':
-            i, j = random.sample(range(len(route)), 2)
-            mutated_route[i], mutated_route[j] = mutated_route[j], mutated_route[i]
-        else:  # replace
-            i = random.randrange(len(route))
-            mutated_route[i] = random.choice(valid_stops)
+        mutated_stops = route_stops.copy()
+        
+        try:
+            if mutation_type == 'swap' and len(mutated_stops) >= 2:
+                # Zamień dwa przystanki miejscami
+                i, j = random.sample(range(len(mutated_stops)), 2)
+                mutated_stops[i], mutated_stops[j] = mutated_stops[j], mutated_stops[i]
+                
+            elif mutation_type == 'replace':
+                # Zamień jeden przystanek na nowy
+                if mutated_stops:
+                    # Usuń stary przystanek z used_stops
+                    old_stop = mutated_stops[random.randrange(len(mutated_stops))]
+                    old_normalized = (round(old_stop[0], 6), round(old_stop[1], 6))
+                    self.used_stops.discard(old_normalized)
+                    
+                    # Znajdź nowy unikatowy przystanek
+                    available_stops = [stop for stop in valid_stops 
+                                     if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
+                    
+                    if available_stops:
+                        new_stop = random.choice(available_stops)
+                        mutated_stops[mutated_stops.index(old_stop)] = new_stop
+                        # Dodaj nowy przystanek do used_stops
+                        new_normalized = (round(new_stop[0], 6), round(new_stop[1], 6))
+                        self.used_stops.add(new_normalized)
+                    else:
+                        # Przywróć stary przystanek jeśli nie ma alternatywy
+                        self.used_stops.add(old_normalized)
+                        
+            elif mutation_type == 'add' and len(mutated_stops) < self.constraints.max_route_length:
+                # Dodaj nowy przystanek
+                available_stops = [stop for stop in valid_stops 
+                                 if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
+                
+                if available_stops:
+                    new_stop = random.choice(available_stops)
+                    insert_position = random.randint(0, len(mutated_stops))
+                    mutated_stops.insert(insert_position, new_stop)
+                    # Dodaj do used_stops
+                    normalized = (round(new_stop[0], 6), round(new_stop[1], 6))
+                    self.used_stops.add(normalized)
+                    
+            elif mutation_type == 'remove' and len(mutated_stops) > self.constraints.min_route_length:
+                # Usuń przystanek
+                if mutated_stops:
+                    removed_stop = mutated_stops.pop(random.randrange(len(mutated_stops)))
+                    # Usuń z used_stops
+                    normalized = (round(removed_stop[0], 6), round(removed_stop[1], 6))
+                    self.used_stops.discard(normalized)
+        
+        except Exception as e:
+            logger.warning(f"Błąd podczas mutacji: {str(e)}")
+            return route
+        
+        # Zapewnij unikatowość i utwórz połączoną trasę
+        unique_stops = self._ensure_unique_stops(mutated_stops)
+        
+        if len(unique_stops) < 2:
+            return route  # Zwróć oryginalną trasę jeśli mutacja się nie powiodła
             
-        return mutated_route
-    
+        try:
+            connected_route = self._create_connected_route(unique_stops)
+            return connected_route
+        except Exception as e:
+            logger.warning(f"Błąd podczas tworzenia połączonej trasy po mutacji: {str(e)}")
+            return route
+
+    def _extract_stops_from_route(self, route: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """
+        Wyodrębnia główne przystanki z trasy (pomijając punkty pośrednie ścieżki).
+        
+        Args:
+            route: Pełna trasa z punktami ścieżki
+            
+        Returns:
+            List[Tuple[float, float]]: Lista głównych przystanków
+        """
+        if len(route) <= 2:
+            return route
+            
+        # Prosty algorytm: weź pierwszy, ostatni i co kilka punktów pośrednich
+        stops = [route[0]]  # Pierwszy punkt
+        
+        # Dodaj punkty pośrednie co określoną liczbę kroków
+        step = max(1, len(route) // 10)  # Około 10 przystanków max
+        for i in range(step, len(route) - 1, step):
+            stops.append(route[i])
+            
+        # Dodaj ostatni punkt jeśli nie jest identyczny z pierwszym
+        if route[-1] != route[0]:
+            stops.append(route[-1])
+            
+        return stops
+
     def optimize(self) -> Tuple[List[Tuple[float, float]], float]:
         """
         Wykonuje optymalizację trasy.
@@ -991,6 +1383,43 @@ class RouteOptimizer:
                        f"najlepszy wynik: {best_score:.2f}")
         
         return best_route, best_score
+
+    def reset_used_stops(self):
+        """Resetuje set używanych przystanków."""
+        self.used_stops.clear()
+        logger.info("Zresetowano używane przystanki")
+
+    def optimize_multiple_routes(self, num_routes: int = 3) -> List[Tuple[List[Tuple[float, float]], float]]:
+        """
+        Optymalizuje wiele tras jednocześnie zapewniając unikatowość przystanków.
+        
+        Args:
+            num_routes: Liczba tras do optymalizacji
+            
+        Returns:
+            List[Tuple[List[Tuple[float, float]], float]]: Lista tras i ich ocen
+        """
+        routes = []
+        
+        for route_idx in range(num_routes):
+            logger.info(f"Optymalizacja trasy {route_idx + 1}/{num_routes}")
+            
+            # Optymalizuj jedną trasę
+            best_route, best_score = self.optimize()
+            
+            if best_route is not None:
+                routes.append((best_route, best_score))
+                logger.info(f"Zakończono trasę {route_idx + 1} z wynikiem: {best_score:.2f}")
+                
+                # Oznacz przystanki tej trasy jako używane dla następnych tras
+                route_stops = self._extract_stops_from_route(best_route)
+                for stop in route_stops:
+                    normalized = (round(stop[0], 6), round(stop[1], 6))
+                    self.used_stops.add(normalized)
+            else:
+                logger.warning(f"Nie udało się znaleźć trasy {route_idx + 1}")
+        
+        return routes
 
     def _create_spatial_index(self):
         """Tworzy spatial index dla szybkiego wyszukiwania najbliższych węzłów."""
@@ -1055,3 +1484,122 @@ class RouteOptimizer:
                        f"Budynki: {stop['buildings_count']}, Coords: {stop['coords']}")
         
         return [stop['coords'] for stop in stop_densities[:top_n]] 
+
+    def optimize_multiple_routes_fast(self, num_routes: int = 3) -> List[Tuple[List[Tuple[float, float]], float]]:
+        """
+        SZYBKA optymalizacja wielu tras - zredukowane parametry dla praktycznego użycia.
+        
+        Args:
+            num_routes: Liczba tras do optymalizacji
+            
+        Returns:
+            List[Tuple[List[Tuple[float, float]], float]]: Lista tras i ich ocen
+        """
+        routes = []
+        
+        # Zapisz oryginalne parametry
+        original_population_size = self.population_size
+        original_generations = self.generations
+        
+        # DRASTYCZNA REDUKCJA PARAMETRÓW DLA SZYBKOŚCI
+        self.population_size = 20  # Zamiast 100
+        self.generations = 15      # Zamiast 50
+        
+        logger.info(f"🚀 SZYBKA optymalizacja {num_routes} tras:")
+        logger.info(f"   Populacja: {self.population_size} (było: {original_population_size})")
+        logger.info(f"   Pokolenia: {self.generations} (było: {original_generations})")
+        logger.info(f"   Łączne ewaluacje: {self.population_size * self.generations * num_routes}")
+        
+        start_total = time.time()
+        
+        for route_idx in range(num_routes):
+            logger.info(f"Optymalizacja trasy {route_idx + 1}/{num_routes}")
+            route_start = time.time()
+            
+            # Optymalizuj jedną trasę z early stopping
+            best_route, best_score = self._optimize_with_early_stopping()
+            
+            route_time = time.time() - route_start
+            
+            if best_route is not None:
+                routes.append((best_route, best_score))
+                logger.info(f"✅ Trasa {route_idx + 1} gotowa w {route_time:.1f}s, wynik: {best_score:.2f}")
+                
+                # Oznacz przystanki tej trasy jako używane
+                route_stops = self._extract_stops_from_route(best_route)
+                for stop in route_stops:
+                    normalized = (round(stop[0], 6), round(stop[1], 6))
+                    self.used_stops.add(normalized)
+                    
+                logger.info(f"   Dodano {len(route_stops)} przystanków do listy używanych")
+            else:
+                logger.warning(f"❌ Nie udało się znaleźć trasy {route_idx + 1}")
+        
+        total_time = time.time() - start_total
+        
+        # Przywróć oryginalne parametry
+        self.population_size = original_population_size
+        self.generations = original_generations
+        
+        logger.info(f"🏁 Zakończono w {total_time:.1f}s (średnio {total_time/num_routes:.1f}s/trasa)")
+        
+        return routes
+    
+    def _optimize_with_early_stopping(self, patience: int = 5) -> Tuple[List[Tuple[float, float]], float]:
+        """
+        Optymalizacja z early stopping - zatrzymuje się gdy brak poprawy.
+        
+        Args:
+            patience: Liczba pokoleń bez poprawy po której zatrzymać
+            
+        Returns:
+            Tuple[List[Tuple[float, float]], float]: Najlepsza trasa i ocena
+        """
+        population = self._create_initial_population()
+        best_route = None
+        best_score = float('-inf')
+        generations_without_improvement = 0
+        
+        for generation in range(self.generations):
+            # Ocena populacji
+            scores = [self._evaluate_route(route) for route in population]
+            
+            # Sprawdź czy jest poprawa
+            max_score_idx = np.argmax(scores)
+            current_best_score = scores[max_score_idx]
+            
+            if current_best_score > best_score:
+                best_score = current_best_score
+                best_route = population[max_score_idx]
+                generations_without_improvement = 0
+                logger.debug(f"🎯 Poprawa w pokoleniu {generation + 1}: {best_score:.3f}")
+            else:
+                generations_without_improvement += 1
+            
+            # Early stopping
+            if generations_without_improvement >= patience:
+                logger.info(f"⏹️ Early stopping po {generation + 1} pokoleniach (brak poprawy przez {patience})")
+                break
+            
+            # Selekcja (tylko najlepsze 50%)
+            selected_indices = np.argsort(scores)[-self.population_size//2:]
+            selected = [population[i] for i in selected_indices]
+            
+            # Tworzenie nowej populacji
+            new_population = selected.copy()
+            
+            while len(new_population) < self.population_size:
+                parent1, parent2 = random.sample(selected, 2)
+                child1, child2 = self._crossover(parent1, parent2)
+                
+                child1 = self._mutate(child1)
+                child2 = self._mutate(child2)
+                
+                if self._is_valid_route(child1):
+                    new_population.append(child1)
+                if self._is_valid_route(child2) and len(new_population) < self.population_size:
+                    new_population.append(child2)
+            
+            population = new_population
+        
+        return best_route, best_score

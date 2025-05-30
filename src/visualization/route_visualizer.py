@@ -25,14 +25,12 @@ class RouteVisualizer:
         self.buildings_df = buildings_df
         self.streets_df = streets_df
         
-        # Transformacja do układu współrzędnych rzutowanych (EPSG:2180 dla Polski)
-        buildings_projected = buildings_df.to_crs(epsg=2180)
-        self.center_lat = buildings_projected.geometry.centroid.y.mean()
-        self.center_lon = buildings_projected.geometry.centroid.x.mean()
+        # Obliczenie centrum na podstawie granic budynków w WGS84
+        bounds = buildings_df.total_bounds
+        min_lon, min_lat, max_lon, max_lat = bounds
         
-        # Konwersja z powrotem do stopni
-        self.center_lat = self.center_lat / 111000  # konwersja z metrów na stopnie
-        self.center_lon = self.center_lon / (111000 * np.cos(np.radians(self.center_lat)))  # uwzględnienie szerokości geograficznej
+        self.center_lat = (min_lat + max_lat) / 2
+        self.center_lon = (min_lon + max_lon) / 2
         
     def create_base_map(self, zoom_start: int = 13) -> folium.Map:
         """
