@@ -125,18 +125,18 @@ class RouteOptimizer:
         for idx, row in self.streets_projected.iterrows():
             coords = list(row.geometry.coords)
             for i in range(len(coords) - 1):
-                # Konwersja współrzędnych do formatu (lat, lon)
-                point1 = (coords[i][1], coords[i][0])  # (lat, lon)
-                point2 = (coords[i + 1][1], coords[i + 1][0])  # (lat, lon)
+                # coords są już w układzie EPSG:2180 (x, y)
+                point1_epsg2180 = coords[i]  # (x, y) w EPSG:2180
+                point2_epsg2180 = coords[i + 1]  # (x, y) w EPSG:2180
                 
-                # Obliczanie odległości używając bezpiecznej metody
-                dist = self._calculate_distance(point1, point2)
+                # Obliczanie odległości używając bezpiecznej metody z EPSG:2180
+                dist = self._calculate_distance(point1_epsg2180, point2_epsg2180, is_wgs84=False)
                 
                 # Dodaj krawędź tylko jeśli odległość jest prawidłowa
                 if dist > 0:
                     G.add_edge(
-                        coords[i],
-                        coords[i + 1],
+                        point1_epsg2180,
+                        point2_epsg2180,
                         weight=dist
                     )
         
@@ -175,12 +175,13 @@ class RouteOptimizer:
         
         return total_score / len(route) if route else 0
     
-    def _validate_coordinates(self, point: Tuple[float, float]) -> bool:
+    def _validate_coordinates(self, point: Tuple[float, float], is_wgs84: bool = False) -> bool:
         """
         Sprawdza czy współrzędne są prawidłowe.
         
         Args:
-            point: Punkt (x, y) w układzie EPSG:2180
+            point: Punkt (x, y) w układzie EPSG:2180 lub (lat, lon) w WGS84
+            is_wgs84: Czy współrzędne są w układzie WGS84
             
         Returns:
             bool: True jeśli współrzędne są prawidłowe
@@ -194,11 +195,17 @@ class RouteOptimizer:
             # Sprawdzenie czy wartości są liczbami
             if not (isinstance(x, (int, float)) and isinstance(y, (int, float))):
                 return False
-                
-            # Sprawdzenie czy wartości są w rozsądnym zakresie dla EPSG:2180
-            # Szersze granice dla Krakowa i okolic
-            if not (233000 <= x <= 252000 and 556000 <= y <= 588000):
-                return False
+            
+            if is_wgs84:
+                # Sprawdzenie czy wartości są w rozsądnym zakresie dla WGS84 (Kraków)
+                if not (49.9 <= x <= 50.2 and 19.8 <= y <= 20.1):
+                    return False
+            else:
+                # Sprawdzenie czy wartości są w rozsądnym zakresie dla EPSG:2180
+                # Bounds for Poland EPSG:2180: northing (x): 125837-908411, easting (y): 144693-876500
+                if not (125000 <= x <= 910000 and 140000 <= y <= 880000):
+                    logger.debug(f"Współrzędne EPSG:2180 poza zakresem: x={x} (125000-910000), y={y} (140000-880000)")
+                    return False
                 
             return True
             
@@ -220,36 +227,24 @@ class RouteOptimizer:
             
         total_distance = 0
         for i in range(len(route) - 1):
-            # Sprawdź czy współrzędne są prawidłowe
-            if not (self._validate_coordinates(route[i]) and self._validate_coordinates(route[i + 1])):
+            # Sprawdź czy współrzędne są prawidłowe (WGS84)
+            if not (self._validate_coordinates(route[i], is_wgs84=True) and 
+                   self._validate_coordinates(route[i + 1], is_wgs84=True)):
                 logger.warning(f"Nieprawidłowe współrzędne w trasie: {route[i]} -> {route[i + 1]}")
                 return 0
                 
-            try:
-                # Konwersja punktów do układu EPSG:2180 dla obliczeń w metrach
-                p1 = gpd.GeoDataFrame(
-                    geometry=[Point(route[i][1], route[i][0])],  # (lon, lat)
-                    crs="EPSG:4326"
-                ).to_crs(epsg=2180)
-                
-                p2 = gpd.GeoDataFrame(
-                    geometry=[Point(route[i + 1][1], route[i + 1][0])],  # (lon, lat)
-                    crs="EPSG:4326"
-                ).to_crs(epsg=2180)
-                
-                # Obliczanie odległości w metrach
-                dist = p1.geometry[0].distance(p2.geometry[0])
-                
-                if dist < self.min_stop_distance:
-                    return 0  # Kara za zbyt małą odległość
-                if dist > self.max_stop_distance:
-                    return 0  # Kara za zbyt dużą odległość
-                    
-                total_distance += dist
-                
-            except Exception as e:
-                logger.warning(f"Błąd podczas obliczania odległości: {str(e)}")
+            # Użyj unifiednej metody obliczania odległości
+            dist = self._calculate_distance(route[i], route[i + 1], is_wgs84=True)
+            
+            if dist == 0:  # Błąd podczas obliczania odległości
                 return 0
+                
+            if dist < self.min_stop_distance:
+                return 0  # Kara za zbyt małą odległość
+            if dist > self.max_stop_distance:
+                return 0  # Kara za zbyt dużą odległość
+                
+            total_distance += dist
             
         # Normalizacja wyniku (im mniejsza odległość, tym lepszy wynik)
         max_possible_distance = self.max_stop_distance * (len(route) - 1)
@@ -269,41 +264,26 @@ class RouteOptimizer:
         min_dist = float('inf')
         nearest_point = None
         
-        # Konwersja punktu do układu EPSG:2180
-        point_gdf = gpd.GeoDataFrame(
-            geometry=[Point(point[1], point[0])],  # (lon, lat)
-            crs="EPSG:4326"
-        ).to_crs(epsg=2180)
-        
-        point_projected = (point_gdf.geometry.x[0], point_gdf.geometry.y[0])
-        
-        # Sprawdzenie wszystkich węzłów w grafie
+        # Sprawdzenie wszystkich węzłów w grafie (węzły są w EPSG:2180)
         for node in self.street_graph.nodes():
-            dist = distance.euclidean(point_projected, node)
-            if dist < min_dist:
-                min_dist = dist
-                nearest_point = node
-        
-        if min_dist <= max_distance:
-            # Konwersja z powrotem do stopni
-            nearest_point_gdf = gpd.GeoDataFrame(
-                geometry=[Point(nearest_point[0], nearest_point[1])],  # (lon, lat)
+            # node jest w formacie (x, y) EPSG:2180
+            # Konwersja węzła z EPSG:2180 do WGS84
+            node_gdf = gpd.GeoDataFrame(
+                geometry=[Point(node[0], node[1])],  # (x, y) w EPSG:2180
                 crs="EPSG:2180"
             ).to_crs(epsg=4326)
             
-            # Konwersja do formatu (lat, lon) i zaokrąglenie do 6 miejsc po przecinku
-            lat = round(nearest_point_gdf.geometry.y[0], 6)
-            lon = round(nearest_point_gdf.geometry.x[0], 6)
+            node_wgs84 = (node_gdf.geometry.y[0], node_gdf.geometry.x[0])  # (lat, lon)
             
-            # Znajdź dokładnie ten sam punkt w grafie
-            for node in self.street_graph.nodes():
-                node_lat = round(node[1], 6)
-                node_lon = round(node[0], 6)
-                if node_lat == lat and node_lon == lon:
-                    return (node_lat, node_lon)
+            # Użyj unifiednej metody obliczania odległości
+            dist = self._calculate_distance(point, node_wgs84, is_wgs84=True)
             
-            # Jeśli nie znaleziono dokładnego dopasowania, zwróć zaokrąglony punkt
-            return (lat, lon)
+            if dist < min_dist and dist > 0:
+                min_dist = dist
+                nearest_point = node_wgs84  # Zwróć punkt w WGS84
+        
+        if min_dist <= max_distance:
+            return nearest_point
         
         logger.warning(f"Nie znaleziono punktu w zasięgu {max_distance}m")
         return None
@@ -390,11 +370,13 @@ class RouteOptimizer:
                 # Użyj bezpiecznej metody obliczania odległości
                 start_dist = self._calculate_distance(
                     (node[1], node[0]),  # (lat, lon)
-                    (start_point[0], start_point[1])  # (lat, lon)
+                    (start_point[0], start_point[1]),  # (lat, lon)
+                    is_wgs84=True
                 )
                 end_dist = self._calculate_distance(
                     (node[1], node[0]),  # (lat, lon)
-                    (end_point[0], end_point[1])  # (lat, lon)
+                    (end_point[0], end_point[1]),  # (lat, lon)
+                    is_wgs84=True
                 )
                 
                 if start_dist < min_start_dist and start_dist > 0:
@@ -448,7 +430,7 @@ class RouteOptimizer:
         """Oblicza całkowitą długość trasy w metrach."""
         total_length = 0
         for i in range(len(route) - 1):
-            total_length += distance.euclidean(route[i], route[i+1])
+            total_length += self._calculate_distance(route[i], route[i+1], is_wgs84=True)
         return total_length
     
     def _is_valid_start_stop(self, point: Tuple[float, float]) -> bool:
@@ -475,30 +457,55 @@ class RouteOptimizer:
                 return True
         return False
     
-    def _calculate_distance(self, point1: Tuple[float, float], point2: Tuple[float, float]) -> float:
+    def _calculate_distance(self, point1: Tuple[float, float], point2: Tuple[float, float], is_wgs84: bool = True) -> float:
         """
         Bezpiecznie oblicza odległość między dwoma punktami w metrach.
         
         Args:
-            point1: Pierwszy punkt (x, y) w układzie EPSG:2180
-            point2: Drugi punkt (x, y) w układzie EPSG:2180
+            point1: Pierwszy punkt - (lat, lon) jeśli is_wgs84=True, (x, y) w EPSG:2180 jeśli is_wgs84=False
+            point2: Drugi punkt - (lat, lon) jeśli is_wgs84=True, (x, y) w EPSG:2180 jeśli is_wgs84=False
+            is_wgs84: Czy współrzędne są w układzie WGS84 (domyślnie True)
             
         Returns:
             float: Odległość w metrach lub 0 w przypadku błędu
         """
         try:
-            if not (self._validate_coordinates(point1) and self._validate_coordinates(point2)):
-                logger.warning(f"Nieprawidłowe współrzędne: {point1} lub {point2}")
-                return 0
-            
             # Sprawdzenie czy współrzędne nie są None lub NaN
             if any(p is None or np.isnan(p) for p in point1 + point2):
                 logger.warning(f"Współrzędne zawierają None lub NaN: {point1}, {point2}")
                 return 0
             
-            # Tworzenie punktów bezpośrednio w układzie EPSG:2180
-            p1 = Point(point1[0], point1[1])  # (x, y)
-            p2 = Point(point2[0], point2[1])  # (x, y)
+            if is_wgs84:
+                # Sprawdzenie czy współrzędne WGS84 są prawidłowe
+                if not (self._validate_coordinates(point1, is_wgs84=True) and 
+                       self._validate_coordinates(point2, is_wgs84=True)):
+                    logger.warning(f"Nieprawidłowe współrzędne WGS84: {point1} lub {point2}")
+                    return 0
+                
+                # Konwersja z WGS84 do EPSG:2180
+                p1_gdf = gpd.GeoDataFrame(
+                    geometry=[Point(point1[1], point1[0])],  # (lon, lat)
+                    crs="EPSG:4326"
+                ).to_crs(epsg=2180)
+                
+                p2_gdf = gpd.GeoDataFrame(
+                    geometry=[Point(point2[1], point2[0])],  # (lon, lat)
+                    crs="EPSG:4326"
+                ).to_crs(epsg=2180)
+                
+                p1 = p1_gdf.geometry[0]
+                p2 = p2_gdf.geometry[0]
+                
+            else:
+                # Sprawdzenie czy współrzędne EPSG:2180 są prawidłowe
+                if not (self._validate_coordinates(point1, is_wgs84=False) and 
+                       self._validate_coordinates(point2, is_wgs84=False)):
+                    logger.warning(f"Nieprawidłowe współrzędne EPSG:2180: {point1} lub {point2}")
+                    return 0
+                
+                # Tworzenie punktów bezpośrednio w układzie EPSG:2180
+                p1 = Point(point1[0], point1[1])  # (x, y)
+                p2 = Point(point2[0], point2[1])  # (x, y)
             
             # Obliczanie odległości w metrach
             distance = float(p1.distance(p2))
@@ -542,7 +549,7 @@ class RouteOptimizer:
             # Sprawdzenie całkowitej długości
             total_length = 0
             for i in range(len(route) - 1):
-                dist = self._calculate_distance(route[i], route[i + 1])
+                dist = self._calculate_distance(route[i], route[i + 1], is_wgs84=True)
                 if dist == 0:  # Błąd podczas obliczania odległości
                     return False
                 total_length += dist
@@ -559,7 +566,7 @@ class RouteOptimizer:
                 
             # Sprawdzenie odległości między przystankami i kątów
             for i in range(len(route) - 1):
-                dist = self._calculate_distance(route[i], route[i + 1])
+                dist = self._calculate_distance(route[i], route[i + 1], is_wgs84=True)
                 if not is_simplified:
                     if not (self.min_stop_distance <= dist <= self.max_stop_distance):
                         logger.debug(f"Nieprawidłowa odległość między przystankami: {dist}m")
