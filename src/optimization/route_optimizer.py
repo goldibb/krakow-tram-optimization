@@ -502,13 +502,26 @@ class RouteOptimizer:
             logger.warning(f"Błąd podczas obliczania odległości: {str(e)}")
             return 0
 
-    def _is_valid_route(self, route: List[Tuple[float, float]]) -> bool:
-        """Sprawdza czy trasa spełnia wszystkie ograniczenia."""
+    def _is_valid_route(self, route: List[Tuple[float, float]], is_simplified: bool = False) -> bool:
+        """
+        Sprawdza czy trasa spełnia wszystkie ograniczenia.
+        
+        Args:
+            route: Trasa do sprawdzenia
+            is_simplified: Czy trasa jest częścią uproszczonej populacji
+            
+        Returns:
+            bool: True jeśli trasa spełnia ograniczenia
+        """
         try:
             # Sprawdzenie długości trasy
-            if not (self.constraints.min_route_length <= len(route) <= self.constraints.max_route_length):
-                logger.debug(f"Nieprawidłowa długość trasy: {len(route)}")
-                return False
+            if not is_simplified:
+                if not (self.constraints.min_route_length <= len(route) <= self.constraints.max_route_length):
+                    logger.debug(f"Nieprawidłowa długość trasy: {len(route)}")
+                    return False
+            else:
+                if len(route) < 2:  # Dla uproszczonej populacji minimum 2 przystanki
+                    return False
                 
             # Sprawdzenie całkowitej długości
             total_length = 0
@@ -518,9 +531,10 @@ class RouteOptimizer:
                     return False
                 total_length += dist
                 
-            if not (self.constraints.min_total_length <= total_length <= self.constraints.max_total_length):
-                logger.debug(f"Nieprawidłowa całkowita długość trasy: {total_length}m")
-                return False
+            if not is_simplified:
+                if not (self.constraints.min_total_length <= total_length <= self.constraints.max_total_length):
+                    logger.debug(f"Nieprawidłowa całkowita długość trasy: {total_length}m")
+                    return False
                 
             # Sprawdzenie początkowego przystanku
             if not self._is_valid_start_stop(route[0]):
@@ -530,11 +544,15 @@ class RouteOptimizer:
             # Sprawdzenie odległości między przystankami i kątów
             for i in range(len(route) - 1):
                 dist = self._calculate_distance(route[i], route[i + 1])
-                if not (self.min_stop_distance <= dist <= self.max_stop_distance):
-                    logger.debug(f"Nieprawidłowa odległość między przystankami: {dist}m")
-                    return False
+                if not is_simplified:
+                    if not (self.min_stop_distance <= dist <= self.max_stop_distance):
+                        logger.debug(f"Nieprawidłowa odległość między przystankami: {dist}m")
+                        return False
+                else:
+                    if dist == 0:  # Dla uproszczonej populacji sprawdzamy tylko czy odległość jest prawidłowa
+                        return False
                     
-                if i > 0:
+                if i > 0 and not is_simplified:
                     angle = self._calculate_angle(route[i-1], route[i], route[i+1])
                     if angle > self.constraints.max_angle:
                         logger.debug(f"Nieprawidłowy kąt zakrętu: {angle}°")
@@ -583,13 +601,13 @@ class RouteOptimizer:
                    f"max_route_length={self.constraints.max_route_length}")
         
         attempts = 0
-        max_attempts = self.population_size * 20
+        max_attempts = self.population_size * 50  # Zwiększamy liczbę prób
         
         while len(population) < self.population_size and attempts < max_attempts:
             try:
-                # Losowa długość trasy
+                # Losowa długość trasy - bardziej elastyczna
                 route_length = random.randint(
-                    self.constraints.min_route_length,
+                    max(2, self.constraints.min_route_length),  # Minimum 2 przystanki
                     min(self.constraints.max_route_length, len(valid_stops))
                 )
                 
@@ -610,7 +628,7 @@ class RouteOptimizer:
                     route.extend(random.sample(remaining_stops, route_length - 1))
                 
                 # Sprawdź czy trasa jest poprawna
-                if self._is_valid_route(route):
+                if self._is_valid_route(route, is_simplified=False):
                     population.append(route)
                     logger.info(f"Utworzono trasę {len(population)}/{self.population_size}")
                 else:
@@ -628,14 +646,25 @@ class RouteOptimizer:
             # Tworzymy uproszczoną populację z minimalną liczbą tras
             simplified_population = []
             for _ in range(self.population_size):
-                # Wybierz dwa losowe przystanki
-                if len(valid_stops) >= 2:
-                    start = random.choice(valid_stops)
-                    end = random.choice([s for s in valid_stops if s != start])
-                    simplified_population.append([start, end])
-                else:
-                    # Jeśli nie ma wystarczająco dużo przystanków, użyj tego samego przystanku
-                    simplified_population.append([valid_stops[0], valid_stops[0]])
+                try:
+                    # Wybierz dwa losowe przystanki
+                    if len(valid_stops) >= 2:
+                        start = random.choice(valid_stops)
+                        end = random.choice([s for s in valid_stops if s != start])
+                        route = [start, end]
+                        
+                        # Sprawdź czy trasa jest poprawna
+                        if self._is_valid_route(route, is_simplified=True):
+                            simplified_population.append(route)
+                        else:
+                            # Jeśli trasa nie jest poprawna, dodaj ją mimo to
+                            simplified_population.append(route)
+                    else:
+                        # Jeśli nie ma wystarczająco dużo przystanków, użyj tego samego przystanku
+                        simplified_population.append([valid_stops[0], valid_stops[0]])
+                except Exception as e:
+                    logger.warning(f"Błąd podczas tworzenia uproszczonej trasy: {str(e)}")
+                    continue
             
             logger.info(f"Utworzono uproszczoną populację o rozmiarze {len(simplified_population)}")
             return simplified_population

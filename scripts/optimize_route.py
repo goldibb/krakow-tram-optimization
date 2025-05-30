@@ -5,39 +5,44 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import geopandas as gpd
 from src.optimization.route_optimizer import RouteOptimizer, RouteConstraints
 from src.visualization.route_visualizer import RouteVisualizer
-from scripts.sourcing_data import TramData, OpenStreetMapData
-from shapely.geometry import Point, LineString
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def load_data(data_dir: str) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """
+    Wczytuje dane z plików GeoJSON.
+    
+    Args:
+        data_dir: Katalog z danymi
+        
+    Returns:
+        tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]: 
+            DataFrames z budynkami, ulicami, przystankami i liniami
+    """
+    buildings_path = os.path.join(data_dir, 'buildings.geojson')
+    streets_path = os.path.join(data_dir, 'streets.geojson')
+    stops_path = os.path.join(data_dir, 'stops.geojson')
+    lines_path = os.path.join(data_dir, 'lines.geojson')
+    
+    logger.info("Wczytywanie danych z plików GeoJSON...")
+    buildings_df = gpd.read_file(buildings_path)
+    streets_df = gpd.read_file(streets_path)
+    stops_df = gpd.read_file(stops_path)
+    lines_df = gpd.read_file(lines_path)
+    
+    logger.info(f"Wczytano {len(buildings_df)} budynków")
+    logger.info(f"Wczytano {len(streets_df)} ulic")
+    logger.info(f"Wczytano {len(stops_df)} przystanków")
+    logger.info(f"Wczytano {len(lines_df)} linii tramwajowych")
+    
+    return buildings_df, streets_df, stops_df, lines_df
+
 def main():
-    # Pobieranie danych
-    logger.info("Pobieranie danych z MPK i OpenStreetMap...")
-    tram_data = TramData()
-    osm_data = OpenStreetMapData()
-    
-    # Konwersja danych do GeoDataFrame
-    logger.info("Przygotowywanie danych do optymalizacji...")
-    
-    # Konwersja przystanków
-    stops_gdf = gpd.GeoDataFrame(
-        tram_data.stops_df,
-        geometry=[Point(lon, lat) for lat, lon in zip(tram_data.stops_df['latitude'], tram_data.stops_df['longitude'])],
-        crs="EPSG:4326"
-    )
-    
-    # Konwersja linii
-    lines_data = []
-    for line, coords in tram_data.mpk_sourcing.lines_stops_coordinates.items():
-        if coords:  # sprawdzenie czy lista nie jest pusta
-            line_geom = LineString([(lon, lat) for lat, lon in coords])
-            lines_data.append({
-                'line': line,
-                'geometry': line_geom
-            })
-    lines_gdf = gpd.GeoDataFrame(lines_data, crs="EPSG:4326")
+    # Wczytanie danych
+    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+    buildings_df, streets_df, stops_df, lines_df = load_data(data_dir)
     
     # Konfiguracja ograniczeń
     constraints = RouteConstraints(
@@ -54,10 +59,10 @@ def main():
     # Inicjalizacja optymalizatora
     logger.info("Inicjalizacja optymalizatora...")
     optimizer = RouteOptimizer(
-        buildings_df=osm_data.buildings_df,
-        streets_df=osm_data.streets_df,
-        stops_df=stops_gdf,
-        lines_df=lines_gdf,
+        buildings_df=buildings_df,
+        streets_df=streets_df,
+        stops_df=stops_df,
+        lines_df=lines_df,
         constraints=constraints,
         population_size=100,
         generations=50,
@@ -65,8 +70,8 @@ def main():
         crossover_rate=0.8,
         min_stop_distance=200,  # 200 metrów
         max_stop_distance=1500,  # 1500 metrów
-        population_weight=0.7,
-        distance_weight=0.3
+        population_weight=0.7,  # waga dla kryterium gęstości zaludnienia
+        distance_weight=0.3     # waga dla kryterium odległości
     )
     
     # Uruchomienie optymalizacji
@@ -80,7 +85,7 @@ def main():
     logger.info(f"Znaleziono trasę z oceną: {best_score:.2f}")
     
     # Inicjalizacja wizualizatora
-    visualizer = RouteVisualizer(osm_data.buildings_df, osm_data.streets_df)
+    visualizer = RouteVisualizer(buildings_df, streets_df)
     
     # Obliczenie granic obszaru
     bounds = (
