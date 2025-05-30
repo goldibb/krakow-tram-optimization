@@ -68,15 +68,23 @@ def main():
         generations=50,
         mutation_rate=0.1,
         crossover_rate=0.8,
-        min_stop_distance=200,  # 200 metrów
-        max_stop_distance=1500,  # 1500 metrów
         population_weight=0.7,  # waga dla kryterium gęstości zaludnienia
         distance_weight=0.3     # waga dla kryterium odległości
     )
     
     # Uruchomienie optymalizacji
     logger.info("Rozpoczynam optymalizację...")
-    best_route, best_score = optimizer.optimize()
+    
+    # Wybór punktów startowego i końcowego
+    start_point = (50.0647, 19.9450)  # Rondo Mogilskie
+    end_point = (50.0720, 19.9570)    # Plac Centralny
+    
+    best_route, best_score = optimizer.optimize_route(
+        start_point=start_point,
+        end_point=end_point,
+        num_stops=5,  # liczba przystanków
+        max_iterations=100  # zmniejszono dla szybszego testowania
+    )
     
     if best_route is None:
         logger.error("Nie znaleziono poprawnej trasy!")
@@ -95,23 +103,25 @@ def main():
         max(lat for lat, lon in best_route)
     )
     
-    # Generowanie mapy gęstości
-    density_map = optimizer.density_calculator.get_density_map(
-        grid_size=0.001,  # rozmiar siatki w stopniach
-        bounds=bounds
-    )
+    # Tworzenie mapy gęstości
+    density_map = visualizer.create_density_map(best_route)
     
     # Wizualizacja wyników
     logger.info("Generowanie wizualizacji...")
+    
+    # Utworzenie katalogu results jeśli nie istnieje
+    results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'results')
+    os.makedirs(results_dir, exist_ok=True)
+    
     m = visualizer.plot_optimization_results(
         best_route=best_route,
         density_map=density_map,
         bounds=bounds,
         score=best_score,
-        save_path="results/optimized_route.html"
+        save_path=os.path.join(results_dir, "optimized_route.html")
     )
     
-    logger.info("Wizualizacja zapisana w results/optimized_route.html")
+    logger.info(f"Wizualizacja zapisana w {os.path.join(results_dir, 'optimized_route.html')}")
 
 if __name__ == "__main__":
     main() 
