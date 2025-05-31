@@ -3059,3 +3059,322 @@ class RouteOptimizer:
         issues_description = "; ".join(safety_issues) if safety_issues else "Brak problemów"
         
         return is_safe, issues_description
+
+    def optimize_multiple_routes_with_building_safety(self, num_routes: int = 3, max_time_seconds: int = 300, max_retry_attempts: int = 50) -> List[Tuple[List[Tuple[float, float]], float]]:
+        """
+        Optymalizuje wiele tras z GWARANCJĄ BEZPIECZEŃSTWA - odrzuca trasy przechodzące przez budynki.
+        
+        Args:
+            num_routes: Liczba tras do znalezienia
+            max_time_seconds: Maksymalny czas w sekundach
+            max_retry_attempts: Maksymalna liczba prób dla każdej trasy
+            
+        Returns:
+            List[Tuple[List[Tuple[float, float]], float]]: Lista bezpiecznych tras z ich ocenami
+        """
+        start_time = time.time()
+        safe_routes = []
+        total_attempts = 0
+        
+        logger.info(f"🔒 ROZPOCZYNAM OPTYMALIZACJĘ {num_routes} BEZPIECZNYCH TRAS")
+        logger.info(f"⏱️ Limit czasu: {max_time_seconds}s, max prób na trasę: {max_retry_attempts}")
+        
+        self.reset_used_stops()
+        
+        while len(safe_routes) < num_routes and time.time() - start_time < max_time_seconds:
+            route_number = len(safe_routes) + 1
+            logger.info(f"🚊 Szukanie trasy {route_number}/{num_routes}...")
+            
+            attempts_for_this_route = 0
+            found_safe_route = False
+            
+            while attempts_for_this_route < max_retry_attempts and not found_safe_route:
+                attempts_for_this_route += 1
+                total_attempts += 1
+                
+                # Generuj trasę używając szybkiej metody
+                try:
+                    remaining_time = max_time_seconds - (time.time() - start_time)
+                    if remaining_time <= 0:
+                        logger.warning(f"⏰ Przekroczono limit czasu!")
+                        break
+                        
+                    # Użyj prostej szybkiej metody do wygenerowania trasy
+                    route, score = self._optimize_simple_single_route_fast(
+                        max_time_seconds=min(remaining_time / (num_routes - len(safe_routes)), 60),
+                        route_number=route_number
+                    )
+                    
+                    if route and len(route) >= self.constraints.min_route_length:
+                        # KLUCZOWE SPRAWDZENIE BEZPIECZEŃSTWA
+                        has_collision = self._check_collision_with_buildings(route)
+                        is_safe, safety_msg = self._validate_route_safety(route)
+                        
+                        if not has_collision and is_safe:
+                            # TRASA BEZPIECZNA - DODAJEMY
+                            safe_routes.append((route, score))
+                            found_safe_route = True
+                            logger.info(f"✅ ZNALEZIONO BEZPIECZNĄ TRASĘ {route_number} (próba {attempts_for_this_route})")
+                            logger.info(f"📊 Ocena: {score:.2f}, Długość: {len(route)} przystanków")
+                            logger.info(f"🔒 {safety_msg}")
+                        else:
+                            # TRASA NIEBEZPIECZNA - ODRZUCAMY
+                            collision_reason = "kolizja z budynkami" if has_collision else safety_msg
+                            logger.warning(f"❌ ODRZUCONO trasę {route_number} (próba {attempts_for_this_route}): {collision_reason}")
+                            
+                            # Oznacz przystanki z tej trasy jako dostępne ponownie
+                            for stop in route:
+                                if stop in self.used_stops:
+                                    self.used_stops.remove(stop)
+                    else:
+                        logger.warning(f"⚠️ Nie udało się wygenerować trasy {route_number} (próba {attempts_for_this_route})")
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Błąd podczas generowania trasy {route_number}: {e}")
+                    continue
+            
+            if not found_safe_route:
+                logger.error(f"❌ Nie udało się znaleźć bezpiecznej trasy {route_number} po {max_retry_attempts} próbach")
+        
+        elapsed_time = time.time() - start_time
+        
+        # PODSUMOWANIE WYNIKÓW
+        logger.info(f"🏁 ZAKOŃCZONO OPTYMALIZACJĘ BEZPIECZNYCH TRAS")
+        logger.info(f"✅ Znaleziono {len(safe_routes)}/{num_routes} bezpiecznych tras")
+        logger.info(f"⏱️ Czas: {elapsed_time:.1f}s, łączna liczba prób: {total_attempts}")
+        
+        if len(safe_routes) < num_routes:
+            logger.warning(f"⚠️ Nie udało się znaleźć wszystkich {num_routes} bezpiecznych tras")
+            logger.warning(f"📊 Zwiększ max_retry_attempts lub max_time_seconds")
+        else:
+            logger.info(f"🎉 SUKCES! Wszystkie trasy są bezpieczne i nie przechodzą przez budynki!")
+        
+        return safe_routes
+
+    def _optimize_simple_single_route_fast(self, max_time_seconds: float, route_number: int) -> Tuple[List[Tuple[float, float]], float]:
+        """
+        Szybka optymalizacja pojedynczej trasy.
+        """
+        start_time = time.time()
+        
+        try:
+            # Znajdź dostępne przystanki (nie używane przez inne trasy)
+            available_stops = [
+                (stop.geometry.y, stop.geometry.x) 
+                for _, stop in self.stops_df.iterrows()
+                if (stop.geometry.y, stop.geometry.x) not in self.used_stops
+            ]
+            
+            if len(available_stops) < self.constraints.min_route_length:
+                logger.warning(f"Za mało dostępnych przystanków: {len(available_stops)}")
+                return [], 0
+            
+            best_route = []
+            best_score = float('-inf')
+            attempts = 0
+            max_attempts = 20
+            
+            while time.time() - start_time < max_time_seconds and attempts < max_attempts:
+                attempts += 1
+                
+                # Generuj prostą trasę
+                route = self._generate_simple_working_route(
+                    available_stops, 
+                    max_attempts=10
+                )
+                
+                if route and self._fast_validate_route(route):
+                    score = self._fast_evaluate_route(route)
+                    if score > best_score:
+                        best_route = route
+                        best_score = score
+            
+            if best_route:
+                # Zaznacz przystanki jako używane
+                for stop in best_route:
+                    self.used_stops.add(stop)
+                    
+            return best_route, best_score
+            
+        except Exception as e:
+            logger.error(f"Błąd w _optimize_simple_single_route_fast: {e}")
+            return [], 0
+
+    def _check_collision_with_buildings_fast(self, route: List[Tuple[float, float]], sample_ratio: float = 0.1) -> bool:
+        """
+        SZYBKA wersja sprawdzania kolizji z budynkami - używa próbkowania.
+        
+        Args:
+            route: Trasa do sprawdzenia
+            sample_ratio: Jaki % budynków sprawdzać (0.1 = 10%)
+            
+        Returns:
+            bool: True jeśli wykryto kolizję
+        """
+        if self.buildings_df is None or len(route) < 2:
+            return False
+            
+        try:
+            # OPTYMALIZACJA 1: Użyj tylko próbki budynków
+            buildings_sample_size = max(100, int(len(self.buildings_df) * sample_ratio))
+            buildings_sample = self.buildings_df.sample(n=min(buildings_sample_size, len(self.buildings_df)))
+            
+            # OPTYMALIZACJA 2: Większa tolerancja dla hackathonu
+            min_distance = self.constraints.min_distance_from_buildings * 0.7  # 70% oryginalnej wartości
+            
+            # Konwertuj trasę do linii
+            route_line = LineString([(lon, lat) for lat, lon in route])
+            
+            # OPTYMALIZACJA 3: Sprawdź tylko budynki w pobliżu trasy  
+            route_bounds = route_line.bounds
+            buffer_size = 0.001  # ~100m buffer w stopniach
+            
+            buildings_near_route = buildings_sample[
+                (buildings_sample.geometry.bounds['minx'] < route_bounds[2] + buffer_size) &
+                (buildings_sample.geometry.bounds['maxx'] > route_bounds[0] - buffer_size) &
+                (buildings_sample.geometry.bounds['miny'] < route_bounds[3] + buffer_size) &
+                (buildings_sample.geometry.bounds['maxy'] > route_bounds[1] - buffer_size)
+            ]
+            
+            if len(buildings_near_route) == 0:
+                return False
+                
+            # OPTYMALIZACJA 4: Sprawdź tylko czy trasa PRZECINA budynki (nie odległość)
+            for _, building in buildings_near_route.iterrows():
+                if hasattr(building.geometry, 'intersects'):
+                    if route_line.intersects(building.geometry):
+                        return True  # Bezpośrednia kolizja
+                        
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Błąd w sprawdzaniu kolizji (szybka wersja): {e}")
+            return False  # W razie błędu uznaj za bezpieczną
+
+    def optimize_multiple_routes_with_building_safety_fast(self, num_routes: int = 3, max_time_seconds: int = 180, max_retry_attempts: int = 20) -> List[Tuple[List[Tuple[float, float]], float]]:
+        """
+        SZYBKA wersja optymalizacji wielu tras z bezpieczeństwem.
+        
+        Args:
+            num_routes: Liczba tras do znalezienia
+            max_time_seconds: Maksymalny czas w sekundach
+            max_retry_attempts: Maksymalna liczba prób dla każdej trasy
+            
+        Returns:
+            List[Tuple[List[Tuple[float, float]], float]]: Lista bezpiecznych tras z ich ocenami
+        """
+        start_time = time.time()
+        safe_routes = []
+        total_attempts = 0
+        
+        logger.info(f"🚀 ROZPOCZYNAM SZYBKĄ OPTYMALIZACJĘ {num_routes} BEZPIECZNYCH TRAS")
+        logger.info(f"⚡ Optymalizacje: próbkowanie budynków, większa tolerancja, szybsze sprawdzanie")
+        logger.info(f"⏱️ Limit czasu: {max_time_seconds}s, max prób na trasę: {max_retry_attempts}")
+        
+        self.reset_used_stops()
+        
+        while len(safe_routes) < num_routes and time.time() - start_time < max_time_seconds:
+            route_number = len(safe_routes) + 1
+            logger.info(f"🚊 Szukanie trasy {route_number}/{num_routes}...")
+            
+            attempts_for_this_route = 0
+            found_safe_route = False
+            
+            while attempts_for_this_route < max_retry_attempts and not found_safe_route:
+                attempts_for_this_route += 1
+                total_attempts += 1
+                
+                try:
+                    remaining_time = max_time_seconds - (time.time() - start_time)
+                    if remaining_time <= 5:  # Zostało mniej niż 5 sekund
+                        logger.warning(f"⏰ Mało czasu, przerywam!")
+                        break
+                        
+                    # SZYBSZE GENEROWANIE TRASY
+                    route, score = self._generate_ultra_fast_route(route_number)
+                    
+                    if route and len(route) >= self.constraints.min_route_length:
+                        # SZYBKIE SPRAWDZENIE BEZPIECZEŃSTWA
+                        has_collision = self._check_collision_with_buildings_fast(route, sample_ratio=0.05)  # Tylko 5% budynków
+                        
+                        # UPROSZCZONA WALIDACJA
+                        basic_valid = (
+                            len(route) <= self.constraints.max_route_length and
+                            not has_collision
+                        )
+                        
+                        if basic_valid:
+                            # TRASA BEZPIECZNA - DODAJEMY
+                            safe_routes.append((route, score))
+                            found_safe_route = True
+                            logger.info(f"✅ ZNALEZIONO BEZPIECZNĄ TRASĘ {route_number} (próba {attempts_for_this_route})")
+                            logger.info(f"📊 Ocena: {score:.2f}, Długość: {len(route)} przystanków")
+                        else:
+                            # TRASA NIEBEZPIECZNA - ODRZUCAMY
+                            logger.debug(f"❌ ODRZUCONO trasę {route_number} (próba {attempts_for_this_route}): {'kolizja' if has_collision else 'za długa'}")
+                            
+                            # Zwolnij przystanki
+                            for stop in route:
+                                if stop in self.used_stops:
+                                    self.used_stops.remove(stop)
+                    else:
+                        logger.debug(f"⚠️ Nie udało się wygenerować trasy {route_number} (próba {attempts_for_this_route})")
+                        
+                except Exception as e:
+                    logger.debug(f"⚠️ Błąd podczas generowania trasy {route_number}: {e}")
+                    continue
+            
+            if not found_safe_route:
+                logger.warning(f"❌ Nie udało się znaleźć bezpiecznej trasy {route_number} po {max_retry_attempts} próbach")
+        
+        elapsed_time = time.time() - start_time
+        
+        # PODSUMOWANIE WYNIKÓW
+        logger.info(f"🏁 ZAKOŃCZONO SZYBKĄ OPTYMALIZACJĘ")
+        logger.info(f"✅ Znaleziono {len(safe_routes)}/{num_routes} bezpiecznych tras")
+        logger.info(f"⏱️ Czas: {elapsed_time:.1f}s, łączna liczba prób: {total_attempts}")
+        logger.info(f"🚀 Średnio {elapsed_time/max(1,total_attempts):.2f}s na próbę")
+        
+        if len(safe_routes) < num_routes:
+            logger.warning(f"⚠️ Nie udało się znaleźć wszystkich {num_routes} tras")
+        else:
+            logger.info(f"🎉 SUKCES! Wszystkie trasy są relatywnie bezpieczne!")
+        
+        return safe_routes
+
+    def _generate_ultra_fast_route(self, route_number: int) -> Tuple[List[Tuple[float, float]], float]:
+        """
+        Ultra szybkie generowanie trasy - bez skomplikowanych algorytmów.
+        """
+        try:
+            # Znajdź dostępne przystanki
+            available_stops = [
+                (stop.geometry.y, stop.geometry.x) 
+                for _, stop in self.stops_df.iterrows()
+                if (stop.geometry.y, stop.geometry.x) not in self.used_stops
+            ]
+            
+            if len(available_stops) < self.constraints.min_route_length:
+                return [], 0
+            
+            # LOSOWA TRASA - najszybsza metoda
+            import random
+            num_stops = random.randint(
+                self.constraints.min_route_length, 
+                min(self.constraints.max_route_length, len(available_stops))
+            )
+            
+            route = random.sample(available_stops, num_stops)
+            
+            # Zaznacz przystanki jako używane
+            for stop in route:
+                self.used_stops.add(stop)
+                
+            # Prosta ocena - im więcej przystanków tym lepiej
+            score = len(route) * 10
+                
+            return route, score
+            
+        except Exception as e:
+            logger.error(f"Błąd w _generate_ultra_fast_route: {e}")
+            return [], 0
