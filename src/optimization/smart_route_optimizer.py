@@ -72,6 +72,7 @@ class SmartRouteOptimizer:
         self._initialize_density_calculator()
         self._create_buildings_buffer()
         self._create_existing_lines_buffer()
+        self._create_water_buffer()
         self._create_stops_kdtree()
         
         # Pamięć algorytmu - uczenie się
@@ -113,6 +114,52 @@ class SmartRouteOptimizer:
                 logger.info(f"Utworzono bufor {self.constraints.buffer_around_existing_lines}m wokół istniejących linii")
             except Exception as e:
                 logger.warning(f"Błąd tworzenia buforu linii: {e}")
+    
+    def _create_water_buffer(self):
+        """Tworzy bufor wokół obszarów wodnych na podstawie danych OpenStreetMap."""
+        self.water_buffer = None
+        try:
+            # Spróbuj znaleźć obszary wodne w danych streets (często tam są kodowane)
+            water_features = []
+            
+            # Sprawdź czy są kolumny związane z wodą
+            water_columns = ['waterway', 'natural', 'landuse', 'water', 'highway']
+            
+            for col in water_columns:
+                if col in self.streets_df.columns:
+                    # Filtruj obiekty wodne
+                    water_mask = self.streets_df[col].isin([
+                        'river', 'stream', 'canal', 'water', 'riverbank', 
+                        'waterway', 'wetland', 'lake', 'pond'
+                    ])
+                    if water_mask.any():
+                        water_features.extend(self.streets_projected[water_mask].geometry.tolist())
+            
+            # Dodaj duże obszary na podstawie geometrii (Wisła ma dużą szerokość)
+            for geom in self.streets_projected.geometry:
+                try:
+                    # Jeśli geometria ma dużą powierzchnię, może być wodą
+                    if hasattr(geom, 'area') and geom.area > 50000:  # 5 hektarów
+                        water_features.append(geom)
+                except:
+                    continue
+            
+            if water_features:
+                water_union = unary_union(water_features)
+                self.water_buffer = water_union.buffer(50)  # 50m bufor wokół wody
+                logger.info(f"Utworzono bufor 50m wokół {len(water_features)} obiektów wodnych")
+            else:
+                # Jako fallback - utwórz przybliżony bufor Wisły na podstawie znanej lokalizacji
+                from shapely.geometry import box
+                # Wisła w Krakowie - przybliżone współrzędne
+                wisla_bbox = box(19.88, 50.04, 19.98, 50.08)  # WGS84
+                wisla_gdf = gpd.GeoDataFrame(geometry=[wisla_bbox], crs="EPSG:4326").to_crs(epsg=2180)
+                self.water_buffer = wisla_gdf.geometry[0].buffer(100)
+                logger.info("Utworzono przybliżony bufor Wisły (100m)")
+                
+        except Exception as e:
+            logger.warning(f"Błąd tworzenia buforu wody: {e}")
+            self.water_buffer = None
     
     def _create_stops_kdtree(self):
         """Tworzy KDTree dla szybkiego wyszukiwania najbliższych przystanków."""
@@ -220,7 +267,7 @@ class SmartRouteOptimizer:
     
     def is_route_safe(self, route: List[Tuple[float, float]]) -> Tuple[bool, str]:
         """
-        Sprawdza czy trasa jest bezpieczna (nie przecina budynków ani istniejących linii).
+        Sprawdza czy trasa jest bezpieczna (nie przecina budynków, wody ani istniejących linii).
         
         Args:
             route: Lista punktów trasy (lat, lon)
@@ -243,23 +290,40 @@ class SmartRouteOptimizer:
             
             route_line = LineString(route_points_projected)
             
-            # Sprawdź kolizje z budynkami (z mniejszym buforem)
+            # Sprawdź czy trasa nie jest zbyt długa (może przechodzić przez wodę)
+            route_length = route_line.length
+            if route_length > self.constraints.max_distance_between_stops * 2:
+                return False, f"Segment za długi: {route_length:.0f}m"
+            
+            # Sprawdź kolizje z budynkami - bardziej restrykcyjne
             if self.buildings_buffer is not None:
                 buffer_intersection = route_line.intersection(self.buildings_buffer)
-                if not buffer_intersection.is_empty and buffer_intersection.length > 50:
-                    return False, "Znacząca kolizja z budynkami"
+                if not buffer_intersection.is_empty and buffer_intersection.length > 10:  # Bardzo mała tolerancja
+                    return False, "Kolizja z budynkami"
             
-            # Sprawdź kolizje z istniejącymi liniami (z mniejszym buforem)
+            # Sprawdź kolizje z istniejącymi liniami - bardziej restrykcyjne  
             if self.existing_lines_buffer is not None:
                 lines_intersection = route_line.intersection(self.existing_lines_buffer)
-                if not lines_intersection.is_empty and lines_intersection.length > 100:
-                    return False, "Znacząca kolizja z istniejącymi liniami tramwajowymi"
+                if not lines_intersection.is_empty and lines_intersection.length > 20:  # Mała tolerancja
+                    return False, "Kolizja z istniejącymi liniami tramwajowymi"
+            
+            # Sprawdź kolizje z wodą - BRAK TOLERANCJI
+            if self.water_buffer is not None:
+                water_intersection = route_line.intersection(self.water_buffer)
+                if not water_intersection.is_empty:
+                    return False, "Kolizja z wodą/rzeką"
+            
+            # Dodatkowe sprawdzenie - czy trasa nie ma dziwnych skoków
+            for i in range(len(route) - 1):
+                segment_distance = self._calculate_distance_wgs84(route[i], route[i + 1])
+                if segment_distance > self.constraints.max_distance_between_stops * 2:
+                    return False, f"Segment zbyt długi: {segment_distance:.0f}m (możliwa kolizja z wodą)"
             
             return True, "Trasa bezpieczna"
             
         except Exception as e:
             logger.debug(f"Błąd sprawdzania bezpieczeństwa: {e}")
-            return True, f"Nie można sprawdzić bezpieczeństwa: {e}"
+            return False, f"Błąd sprawdzania bezpieczeństwa: {e}"
     
     def calculate_route_score(self, route: List[Tuple[float, float]]) -> float:
         """
@@ -372,89 +436,56 @@ class SmartRouteOptimizer:
         logger.debug(f"Budowanie lokalnej trasy z {target_stops} przystankami...")
         
         for step in range(target_stops - 1):
-            # Znajdź pobliskie przystanki z większym zasięgiem
-            search_radius = self.constraints.max_distance_between_stops * (2.0 + step * 0.2)  # Zwiększaj zasięg z każdym krokiem
+            # Znajdź pobliskie przystanki - bardziej konserwatywny zasięg
+            search_radius = self.constraints.max_distance_between_stops * (1.2 + step * 0.1)  # Mniejszy zasięg
             nearby_stops = self.find_nearby_stops(
                 current_lat, current_lon, 
                 max_distance=search_radius
             )
             
-            # Filtruj już używane przystanki - mniej restrykcyjne odległości
-            min_distance = self.constraints.min_distance_between_stops * 0.5  # Zmniejszona minimalna odległość
+            # Filtruj już używane przystanki - bardziej restrykcyjne odległości
+            min_distance = self.constraints.min_distance_between_stops * 0.8  # Zwiększona minimalna odległość
             available_stops = [
                 (lat, lon, dist) for lat, lon, dist in nearby_stops
                 if (round(lat, 6), round(lon, 6)) not in used_stops
                 and dist >= min_distance
+                and dist <= self.constraints.max_distance_between_stops * 1.5  # Maksymalna odległość
             ]
             
             if not available_stops:
                 logger.debug(f"Brak dostępnych przystanków w kroku {step + 1}, zasięg: {search_radius:.0f}m")
-                # Spróbuj z jeszcze większym zasięgiem
-                extended_stops = self.find_nearby_stops(
-                    current_lat, current_lon, 
-                    max_distance=search_radius * 2
-                )
-                available_stops = [
-                    (lat, lon, dist) for lat, lon, dist in extended_stops
-                    if (round(lat, 6), round(lon, 6)) not in used_stops
-                    and dist >= min_distance * 0.5  # Jeszcze mniejsza minimalna odległość
-                ]
-                
-                if not available_stops:
-                    logger.debug(f"Nadal brak przystanków - przerywam budowanie trasy")
-                    break
+                break
             
             # Wybierz najlepszy przystanek na podstawie gęstości i odległości
             best_stop = None
             best_score = -1
             
-            # Sprawdź więcej kandydatów, mniej restrykcyjne bezpieczeństwo
-            for lat, lon, dist in available_stops[:20]:  # Sprawdź więcej kandydatów
+            # ZAWSZE sprawdzaj bezpieczeństwo - usunąłem pomijanie dla pierwszych kroków
+            for lat, lon, dist in available_stops[:10]:  # Mniej kandydatów dla szybkości
                 
-                # Dla pierwszych 3 kroków - mniej restrykcyjne sprawdzanie bezpieczeństwa
-                if step < 3:
-                    is_safe = True
-                    safety_reason = "Wczesny krok - pomijam sprawdzanie"
-                else:
-                    test_route = route + [(lat, lon)]
-                    is_safe, safety_reason = self.is_route_safe(test_route)
+                # ZAWSZE sprawdzaj bezpieczeństwo połączenia
+                test_route = route + [(lat, lon)]
+                is_safe, safety_reason = self.is_route_safe(test_route)
                 
                 if is_safe:
                     # Oblicz ocenę przystanku
                     density = self.density_calculator.calculate_density_at_point(lat, lon)
                     
-                    # Ocena: gęstość (60%) + odległość (30%) + różnorodność (10%)
-                    distance_score = min(1.0, dist / self.constraints.max_distance_between_stops)
-                    
-                    # Bonus za różnorodność kierunków
-                    direction_bonus = 0.0
-                    if len(route) >= 2:
-                        # Sprawdź czy nowy punkt tworzy różny kierunek
-                        prev_direction = np.arctan2(route[-1][0] - route[-2][0], route[-1][1] - route[-2][1])
-                        new_direction = np.arctan2(lat - route[-1][0], lon - route[-1][1])
-                        angle_diff = abs(prev_direction - new_direction)
-                        direction_bonus = min(angle_diff / np.pi, 1.0) * 0.1
-                    
-                    combined_score = density * 0.6 + (1 - distance_score) * 0.3 + direction_bonus
-                    
-                    if combined_score > best_score:
-                        best_score = combined_score
-                        best_stop = (lat, lon)
+                    # Sprawdź czy odległość jest w dozwolonym zakresie
+                    if self.constraints.min_distance_between_stops <= dist <= self.constraints.max_distance_between_stops:
+                        # Ocena: gęstość (70%) + odległość (30%)
+                        distance_score = 1.0 - abs(dist - 525) / 525  # Preferuj ~525m (środek zakresu)
+                        combined_score = density * 0.7 + distance_score * 0.3
                         
-                elif step < 2:
-                    logger.debug(f"Nie bezpieczne połączenie w kroku {step}: {safety_reason}")
+                        if combined_score > best_score:
+                            best_score = combined_score
+                            best_stop = (lat, lon)
+                else:
+                    logger.debug(f"Odrzucono przystanek ({lat:.6f}, {lon:.6f}) - {safety_reason}")
             
             if best_stop is None:
-                logger.debug(f"Nie znaleziono odpowiedniego przystanku w kroku {step + 1}")
-                # Jako ostateczność - weź pierwszy dostępny przystanek
-                if available_stops:
-                    lat, lon, dist = available_stops[0]
-                    route.append((lat, lon))
-                    used_stops.add((round(lat, 6), round(lon, 6)))
-                    current_lat, current_lon = lat, lon
-                    logger.debug(f"Dodano przystanek awaryjny: ({lat:.6f}, {lon:.6f})")
-                else:
-                    break
+                logger.debug(f"Nie znaleziono bezpiecznego przystanku w kroku {step + 1}")
+                break
             else:
                 route.append(best_stop)
                 used_stops.add((round(best_stop[0], 6), round(best_stop[1], 6)))

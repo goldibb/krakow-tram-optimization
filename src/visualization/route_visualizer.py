@@ -437,4 +437,131 @@ class RouteVisualizer:
                 name=f'Przystanek {i+1}'
             ).add_to(map_obj)
             
-        return map_obj 
+        return map_obj
+    
+    def plot_route_sequential(self, route: List[Tuple[float, float]], map_obj, 
+                            route_name: str = "Sequential Route", color: str = 'green', 
+                            max_segment_length: float = 800):
+        """
+        NOWA METODA: Wizualizuje trasę sekwencyjną bez skoków z kontrolą odległości.
+        
+        Args:
+            route: Lista punktów trasy (lat, lon)
+            map_obj: Obiekt mapy Folium
+            route_name: Nazwa trasy
+            color: Kolor linii
+            max_segment_length: Maksymalna długość segmentu w metrach (długie segmenty = skoki)
+        """
+        if not route or len(route) < 2:
+            return
+        
+        logger.info(f"🎨 Wizualizacja sekwencyjna: {len(route)} punktów, max segment {max_segment_length}m")
+        
+        # Dodaj przystanki jako markery
+        for i, (lat, lon) in enumerate(route):
+            # Różne ikony dla pierwszego, ostatniego i pośrednich przystanków
+            if i == 0:
+                icon_color = 'green'
+                icon = 'play'
+                popup_text = f"🚀 START\nPunkt {i+1}\nLat: {lat:.6f}, Lon: {lon:.6f}"
+            elif i == len(route) - 1:
+                icon_color = 'red'
+                icon = 'stop'
+                popup_text = f"🏁 KONIEC\nPunkt {i+1}\nLat: {lat:.6f}, Lon: {lon:.6f}"
+            else:
+                icon_color = 'blue'
+                icon = 'record'
+                popup_text = f"🚏 PRZYSTANEK\nPunkt {i+1}\nLat: {lat:.6f}, Lon: {lon:.6f}"
+            
+            # Dodaj marker
+            folium.Marker(
+                [lat, lon],
+                popup=popup_text,
+                tooltip=f"Punkt {i+1}",
+                icon=folium.Icon(color=icon_color, icon=icon)
+            ).add_to(map_obj)
+        
+        # Dodaj linie między przystankami z kontrolą skoków
+        connected_segments = 0
+        skipped_segments = 0
+        
+        for i in range(len(route) - 1):
+            point1 = route[i]
+            point2 = route[i + 1]
+            
+            # Oblicz odległość między punktami (przybliżona)
+            lat1, lon1 = point1
+            lat2, lon2 = point2
+            
+            # Prosta formuła haversine dla odległości (w metrach)
+            import math
+            R = 6371000  # Promień Ziemi w metrach
+            
+            dlat = math.radians(lat2 - lat1)
+            dlon = math.radians(lon2 - lon1)
+            a = (math.sin(dlat/2) * math.sin(dlat/2) + 
+                 math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * 
+                 math.sin(dlon/2) * math.sin(dlon/2))
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+            distance = R * c
+            
+            if distance <= max_segment_length:
+                # Normalny segment - narysuj zieloną linię
+                folium.PolyLine(
+                    [point1, point2],
+                    color=color,
+                    weight=3,
+                    opacity=0.8,
+                    popup=f"Segment {i+1}-{i+2}: {distance:.0f}m"
+                ).add_to(map_obj)
+                connected_segments += 1
+                
+            else:
+                # Skok wykryty - narysuj czerwoną przerywaną linię
+                folium.PolyLine(
+                    [point1, point2],
+                    color='red',
+                    weight=2,
+                    opacity=0.5,
+                    dash_array='10, 10',
+                    popup=f"⚠️ SKOK {i+1}-{i+2}: {distance:.0f}m > {max_segment_length}m"
+                ).add_to(map_obj)
+                skipped_segments += 1
+                
+                # Dodaj marker ostrzeżenia w środku skoku
+                mid_lat = (lat1 + lat2) / 2
+                mid_lon = (lon1 + lon2) / 2
+                
+                folium.Marker(
+                    [mid_lat, mid_lon],
+                    popup=f"⚠️ SKOK: {distance:.0f}m",
+                    tooltip="Wykryto skok!",
+                    icon=folium.Icon(color='orange', icon='warning-sign')
+                ).add_to(map_obj)
+        
+        # Dodaj legendę z informacjami o trasie
+        legend_html = f'''
+        <div style="position: fixed; 
+                    bottom: 50px; left: 50px; width: 300px; height: 120px; 
+                    background-color: white; border:2px solid grey; z-index:9999; 
+                    font-size:14px; padding: 10px">
+        <h4>{route_name}</h4>
+        <p><b>📍 Punkty:</b> {len(route)}</p>
+        <p><b>✅ Połączenia:</b> {connected_segments}</p>
+        <p><b>⚠️ Skoki:</b> {skipped_segments}</p>
+        <p><b>🎯 Max segment:</b> {max_segment_length}m</p>
+        </div>
+        '''
+        map_obj.get_root().html.add_child(folium.Element(legend_html))
+        
+        logger.info(f"   ✅ {connected_segments} normalnych połączeń")
+        logger.info(f"   ⚠️ {skipped_segments} skoków wykrytych")
+        
+        # Automatyczne dopasowanie widoku mapy
+        if route:
+            lats = [lat for lat, lon in route]
+            lons = [lon for lat, lon in route]
+            
+            sw = [min(lats), min(lons)]
+            ne = [max(lats), max(lons)]
+            map_obj.fit_bounds([sw, ne], padding=(20, 20)) 

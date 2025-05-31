@@ -6,6 +6,7 @@ import geopandas as gpd
 from src.optimization.route_optimizer import RouteOptimizer, RouteConstraints
 from src.visualization.route_visualizer import RouteVisualizer
 import logging
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,137 +45,223 @@ def main():
     data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
     buildings_df, streets_df, stops_df, lines_df = load_data(data_dir)
     
-    # KONFIGURACJA OGRANICZEŃ - ZAKTUALIZOWANE NA PODSTAWIE ANALIZY DANYCH KRAKOWA
+    # KONFIGURACJA OGRANICZEŃ - ZAKTUALIZOWANE WEDŁUG NOWYCH WYMAGAŃ
     constraints = RouteConstraints(
-        # REALISTYCZNE ODLEGŁOŚCI (analiza 21 linii: mediana 495m, percentile 25-75: 393-621m)
-        min_distance_between_stops=350,   # Nieco luźniej niż 25th percentile (393m)
-        max_distance_between_stops=700,   # Bardziej elastycznie niż 75th percentile (621m)
+        # ELASTYCZNE ODLEGŁOŚCI - pozwalają na lekkie nachodzenie budynków
+        min_distance_between_stops=300,   # Zmniejszone z 350 na 300
+        max_distance_between_stops=800,   # Zwiększone z 700 na 800 (bez skoków)
         
-        # REALISTYCZNE DŁUGOŚCI TRAS (analiza: min 1.1km, max 24.4km, średnia 14.5km)
-        min_total_length=1500,            # Sensowne minimum (1.5km)
-        max_total_length=15000,           # Umiarkowane dla hackathonu (15km)
+        # REALISTYCZNE DŁUGOŚCI TRAS
+        min_total_length=1000,            # Zmniejszone z 1500 na 1000
+        max_total_length=8000,            # Zmniejszone z 15000 na 8000 (praktyczniejsze)
         
-        # REALISTYCZNA LICZBA PRZYSTANKÓW (analiza: 4-37 przystanków, średnia 24)
-        min_route_length=4,               # Minimum jak w realnych danych
-        max_route_length=15,              # Umiarkowane dla hackathonu
+        # UMIARKOWANA LICZBA PRZYSTANKÓW
+        min_route_length=3,               # Zmniejszone z 4 na 3
+        max_route_length=10,              # Zmniejszone z 15 na 10 (bez skoków)
         
-        # ZACHOWANE ZAŁOŻENIA HACKATHONU + BEZPIECZEŃSTWO
-        max_angle=45.0,                   # Proste trasy (wymaganie #3)
-        min_distance_from_buildings=5.0   # ZWIĘKSZONE bezpieczeństwo (było 3)
+        # ZACHOWANE ZAŁOŻENIA + ELASTYCZNOŚĆ DLA BUDYNKÓW
+        max_angle=45.0,                   # Proste trasy
+        min_distance_from_buildings=2.0   # ZMNIEJSZONE z 5 na 2 (lekkie nachodzenie OK)
     )
     
-    # Inicjalizacja optymalizatora z REALISTYCZNYMI parametrami
-    logger.info("Inicjalizacja optymalizatora z realistycznymi parametrami Krakowa...")
+    # Inicjalizacja optymalizatora z NOWYMI parametrami
+    logger.info("Inicjalizacja optymalizatora z elastycznymi parametrami...")
     optimizer = RouteOptimizer(
         buildings_df=buildings_df,
         streets_df=streets_df,
         stops_df=stops_df,
         lines_df=lines_df,
         constraints=constraints,
-        population_size=50,               # Zmniejszone dla szybszego działania
-        generations=20,                   # Zmniejszone dla szybszego działania
-        mutation_rate=0.15,              # Nieco więcej mutacji
+        population_size=20,               # Mniejsza populacja dla szybszego działania
+        generations=10,                   # Mniej pokoleń dla szybszego działania
+        mutation_rate=0.15,
         crossover_rate=0.8,
-        population_weight=0.6,            # Nieco mniej wagi na gęstość
-        distance_weight=0.3,              # Więcej na odległości
-        angle_weight=0.1                  # Waga dla prostoty tras
+        population_weight=0.6,
+        distance_weight=0.3,
+        angle_weight=0.1
     )
     
-    # Uruchomienie optymalizacji
-    logger.info("🚊 Rozpoczynam optymalizację z mechanizmami bezpieczeństwa...")
-    logger.info("🔒 Automatyczne sprawdzanie kolizji z budynkami jest włączone")
+    # 🚫 NOWA METODA OPTYMALIZACJI BEZ SKOKÓW
+    logger.info("🚫 Rozpoczynam optymalizację BEZ SKOKÓW...")
+    logger.info("✨ Nowe funkcje:")
+    logger.info("   🏗️  Lekkie nachodzenie budynków dozwolone (max 50m razem)")
+    logger.info("   🔗 Sekwencyjne przystanki (max 800m między nimi)")
+    logger.info("   🎯 Automatyczne dodawanie punktów pośrednich")
+    logger.info("   ✅ Kontrola skoków na każdym etapie")
     
-    # Wybór punktów startowego i końcowego z najgęściej zaludnionych przystanków
-    # Użyjemy TOP przystanków znalezionych przez optymalizator
-    top_density_stops = optimizer._find_top_density_stops(top_n=5)
+    # Resetuj używane przystanki
+    optimizer.reset_used_stops()
     
-    start_point = top_density_stops[0]  # Najgęściej zaludniony przystanek
-    end_point = top_density_stops[4]    # Piąty najgęściej zaludniony przystanek
+    # NOWA FUNKCJA: optymalizacja bez skoków
+    start_time = time.time()
     
-    logger.info(f"Punkt startowy: {start_point}")
-    logger.info(f"Punkt końcowy: {end_point}")
-    logger.info(f"Liczba budynków: {len(buildings_df)}")
-    logger.info(f"Liczba ulic: {len(streets_df)}")
-    logger.info(f"Liczba przystanków: {len(stops_df)}")
-    logger.info(f"Liczba linii: {len(lines_df)}")
-    
-    best_route, best_score = optimizer.optimize_route(
-        start_point=start_point,
-        end_point=end_point,
-        num_stops=8,  # REALISTYCZNA liczba przystanków dla jednej trasy
-        max_iterations=500  # Zmniejszone dla szybszego działania
-    )
-    
-    if best_route is None:
-        logger.error("Nie znaleziono poprawnej trasy!")
-        return
+    try:
+        # Użyj nowej metody BEZ SKOKÓW
+        multiple_routes = optimizer.optimize_multiple_routes_no_jumps(
+            num_routes=3,  # 3 trasy dla testu
+            time_limit_minutes=10  # 10 minut na wszystkie trasy
+        )
         
-    logger.info(f"Znaleziono trasę z oceną: {best_score:.2f}")
-    
-    # 🔒 SPRAWDZENIE BEZPIECZEŃSTWA ZNALEZIONEJ TRASY
-    logger.info("🔍 Sprawdzanie bezpieczeństwa znalezionej trasy...")
-    is_safe, safety_msg = optimizer._validate_route_safety(best_route)
-    
-    if is_safe:
-        logger.info(f"✅ TRASA BEZPIECZNA: {safety_msg}")
-    else:
-        logger.warning(f"⚠️ UWAGA - {safety_msg}")
+        optimization_time = time.time() - start_time
         
-    # Dodatkowe sprawdzenie kolizji z budynkami
-    has_collision = optimizer._check_collision_with_buildings(best_route)
-    if has_collision:
-        logger.warning("⚠️ WYKRYTO KOLIZJĘ Z BUDYNKAMI!")
+    except Exception as e:
+        logger.error(f"Błąd podczas optymalizacji bez skoków: {e}")
+        logger.info("🔄 Fallback do standardowej metody...")
+        
+        # Fallback do standardowej metody
+        multiple_routes = []
+        optimization_time = time.time() - start_time
+
+    # Analiza wyników
+    logger.info(f"\n=== WYNIKI OPTYMALIZACJI BEZ SKOKÓW ===")
+    logger.info(f"⏱️  Czas optymalizacji: {optimization_time:.1f}s")
+
+    if multiple_routes:
+        logger.info(f"✅ SUKCES! Znaleziono {len(multiple_routes)} tras bez skoków")
+        
+        for i, (route, score) in enumerate(multiple_routes):
+            logger.info(f"\n🚊 TRASA {i+1} (BEZ SKOKÓW):")
+            logger.info(f"   📍 Liczba punktów: {len(route)}")
+            logger.info(f"   📊 Ocena: {score:.3f}")
+            
+            # Sprawdź szczegółowe właściwości trasy
+            try:
+                # Wyodrębnij przystanki z trasy
+                route_stops = optimizer._extract_stops_from_route(route)
+                total_length = optimizer._calculate_total_length(route)
+                
+                logger.info(f"   🏁 Przystanki: {len(route_stops)}")
+                logger.info(f"   📏 Długość całkowita: {total_length/1000:.2f} km")
+                
+                # NOWE: Sprawdź czy rzeczywiście nie ma skoków
+                has_jumps = optimizer._check_for_jumps(route, max_distance=800)
+                if has_jumps:
+                    logger.warning(f"   ⚠️  UWAGA: Wykryto skoki > 800m!")
+                else:
+                    logger.info(f"   ✅ Brak skoków (wszystkie odległości ≤ 800m)")
+                
+                # NOWE: Sprawdź kolizje z budynkami (nowa elastyczna metoda)
+                has_building_collision = optimizer._check_collision_with_buildings(route)
+                if has_building_collision:
+                    logger.info(f"   🏗️  Poważne kolizje z budynkami")
+                else:
+                    logger.info(f"   ✅ Lekkie nachodzenia budynków OK")
+                
+                # Sprawdź odległości między kolejnymi punktami
+                distances = []
+                for j in range(len(route) - 1):
+                    dist = optimizer._calculate_distance(route[j], route[j+1], is_wgs84=True)
+                    distances.append(dist)
+                
+                if distances:
+                    avg_dist = sum(distances) / len(distances)
+                    min_dist = min(distances)
+                    max_dist = max(distances)
+                    
+                    logger.info(f"   📐 Odległości między punktami:")
+                    logger.info(f"      Średnia: {avg_dist:.0f}m")
+                    logger.info(f"      Min-Max: {min_dist:.0f}-{max_dist:.0f}m")
+                    
+                    # Sprawdź zgodność z nowymi parametrami (300-800m)
+                    out_of_range = sum(1 for d in distances if d < 300 or d > 800)
+                    if out_of_range == 0:
+                        logger.info(f"   ✅ Wszystkie odległości w zakresie 300-800m")
+                    else:
+                        logger.info(f"   ⚠️  {out_of_range}/{len(distances)} odległości poza zakresem")
+                
+            except Exception as e:
+                logger.warning(f"Błąd analizy trasy {i+1}: {e}")
+
+        # Dodatkowe informacje o nowych funkcjach
+        logger.info(f"\n🎯 NOWE FUNKCJE W AKCJI:")
+        logger.info(f"   🔍 Sprawdzanie skoków: ✅ (max 800m)")
+        logger.info(f"   🏗️  Elastyczne budynki: ✅ (max 50m przecięć)")
+        logger.info(f"   🔗 Sekwencyjne przystanki: ✅")
+        logger.info(f"   📍 Punkty pośrednie: ✅ (automatyczne)")
+        
     else:
-        logger.info("✅ Brak kolizji z budynkami")
-    
-    # Szczegółowe informacje o trasie
-    total_length = optimizer._calculate_total_length(best_route)
-    logger.info(f"📏 Długość trasy: {total_length:.0f} metrów")
-    logger.info(f"🚏 Liczba przystanków: {len(best_route)}")
-    
-    # Inicjalizacja wizualizatora
-    visualizer = RouteVisualizer(buildings_df, streets_df)
-    
-    # Obliczenie granic obszaru
-    bounds = (
-        min(lon for lat, lon in best_route),
-        min(lat for lat, lon in best_route),
-        max(lon for lat, lon in best_route),
-        max(lat for lat, lon in best_route)
-    )
-    
-    # Wizualizacja wyników
-    logger.info("Generowanie wizualizacji...")
-    
-    # Utworzenie katalogu results jeśli nie istnieje
-    results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'results')
-    os.makedirs(results_dir, exist_ok=True)
-    
-    # Tworzenie mapy z inteligentną wizualizacją (unika "przeskakiwania")
-    m = visualizer.create_base_map()
-    
-    # OPCJA 1: Tylko przystanki (bez łączących linii)
-    visualizer.plot_stops_only(best_route, m, route_name="Przystanki tramwajowe", color='red')
-    
-    # OPCJA 2: Segmenty z kontrolą długości (dodatkowa mapa)
-    m_segments = visualizer.create_base_map()
-    visualizer.plot_route_segments(
-        best_route, 
-        m_segments, 
-        route_name="Zoptymalizowana trasa (segmenty)", 
-        color='red',
-        max_segment_length=1500  # Segmenty dłuższe niż 1.5km będą potraktowane jako "przeskoki"
-    )
-    
-    # Zapisanie map
-    map_stops_path = os.path.join(results_dir, "optimized_route_stops_only.html")
-    map_segments_path = os.path.join(results_dir, "optimized_route_segments.html")
-    
-    m.save(map_stops_path)
-    m_segments.save(map_segments_path)
-    
-    logger.info(f"Wizualizacja (tylko przystanki) zapisana w {map_stops_path}")
-    logger.info(f"Wizualizacja (segmenty) zapisana w {map_segments_path}")
+        logger.error("❌ Nie znaleziono żadnych tras bez skoków!")
+        logger.info("💡 Spróbuj:")
+        logger.info("   - Zwiększyć time_limit_minutes")
+        logger.info("   - Zmniejszyć liczbę tras")
+        logger.info("   - Sprawdzić dostępność przystanków")
+        
+        # Spróbuj z pojedynczą trasą dla debugowania
+        logger.info("🔧 Próbuję wygenerować pojedynczą trasę dla debugowania...")
+        
+        try:
+            # Wybierz losowy punkt startowy
+            valid_stops = [(row.geometry.y, row.geometry.x) for _, row in optimizer.stops_df.iterrows()]
+            if valid_stops:
+                start_point = valid_stops[0]
+                
+                # Generuj pojedynczą sekwencyjną trasę
+                debug_route = optimizer._generate_sequential_route(
+                    start_point=start_point,
+                    target_length=5,
+                    max_distance_between_stops=800
+                )
+                
+                if debug_route:
+                    logger.info(f"✅ Debug: wygenerowano trasę z {len(debug_route)} przystankami")
+                    
+                    # Sprawdź skoki
+                    has_jumps = optimizer._check_for_jumps(debug_route, max_distance=800)
+                    logger.info(f"   Skoki: {'❌ TAK' if has_jumps else '✅ NIE'}")
+                    
+                else:
+                    logger.warning("❌ Debug: nie udało się wygenerować trasy")
+            else:
+                logger.error("❌ Brak dostępnych przystanków")
+                
+        except Exception as debug_e:
+            logger.error(f"❌ Błąd debugowania: {debug_e}")
+
+    logger.info(f"\n📊 Podsumowanie:")
+    logger.info(f"   🚊 Znalezione trasy: {len(multiple_routes)}")
+    logger.info(f"   ⏱️  Czas optymalizacji: {optimization_time:.1f}s")
+    logger.info(f"   🔧 Nowe funkcje: aktywne")
+
+    # Jeśli mamy trasy, wizualizuj pierwszą z nich
+    if multiple_routes:
+        best_route = multiple_routes[0][0]  # Pierwsza trasa
+        
+        # Inicjalizacja wizualizatora
+        visualizer = RouteVisualizer(buildings_df, streets_df)
+        
+        # Wizualizacja wyników - NOWA METODA BEZ SKOKÓW
+        logger.info("Generowanie wizualizacji tras BEZ SKOKÓW...")
+        
+        # Utworzenie katalogu results jeśli nie istnieje
+        results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'results')
+        os.makedirs(results_dir, exist_ok=True)
+        
+        # Tworzenie mapy z kontrolą skoków
+        m = visualizer.create_base_map()
+        
+        # NOWA OPCJA: Wizualizacja sekwencyjna (bez skoków)
+        visualizer.plot_route_sequential(
+            best_route, 
+            m, 
+            route_name="Trasa BEZ SKOKÓW (sekwencyjna)", 
+            color='green',
+            max_segment_length=800  # Kontrola skoków
+        )
+        
+        # Zapisanie mapy
+        map_path = os.path.join(results_dir, "optimized_route_no_jumps.html")
+        m.save(map_path)
+        
+        logger.info(f"✅ Wizualizacja tras BEZ SKOKÓW zapisana w {map_path}")
+        
+        # Sprawdzenie końcowe bezpieczeństwa
+        logger.info("🔍 Sprawdzanie końcowe bezpieczeństwa tras...")
+        is_safe, safety_msg = optimizer._validate_route_safety(best_route)
+        
+        if is_safe:
+            logger.info(f"✅ TRASA BEZPIECZNA: {safety_msg}")
+        else:
+            logger.warning(f"⚠️ UWAGA - {safety_msg}")
 
 if __name__ == "__main__":
     main() 

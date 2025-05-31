@@ -493,13 +493,14 @@ class RouteOptimizer:
             else:
                 return self._find_safe_alternative_path(start_point, end_point) or [start_point, end_point]
 
-    def _is_route_safe_from_buildings(self, route: List[Tuple[float, float]], min_distance: float = 5.0) -> bool:
+    def _is_route_safe_from_buildings(self, route: List[Tuple[float, float]], min_distance: float = 2.0) -> bool:
         """
-        NOWA FUNKCJA: Sprawdza czy trasa jest bezpieczna od budynków (nie przecina i zachowuje dystans).
+        ULEPSZONE: Sprawdza czy trasa jest bezpieczna od budynków - BARDZIEJ ELASTYCZNE.
+        Pozwala na lekkie nachodzenie na budynki, ale nie na długie odcinki przez budynki.
         
         Args:
             route: Trasa do sprawdzenia
-            min_distance: Minimalna odległość od budynków w metrach
+            min_distance: Minimalna odległość od budynków w metrach (zmniejszone z 5 na 2)
             
         Returns:
             bool: True jeśli trasa jest bezpieczna
@@ -518,26 +519,53 @@ class RouteOptimizer:
             
             route_line_projected = LineString(route_points)
             
-            # Sprawdź kolizje z budynkami - BARDZIEJ RESTRYKCYJNE SPRAWDZENIE
+            # NOWE: Sprawdzenie długich segmentów przez budynki (to jest problem!)
+            dangerous_intersections = 0
+            total_intersection_length = 0
+            
+            # Sprawdź każdy budynek
             for _, building in self.buildings_projected.iterrows():
-                # 1. Sprawdź czy trasa przecina budynek bezpośrednio
+                # 1. Sprawdź czy trasa przecina budynek
                 if route_line_projected.intersects(building.geometry):
-                    logger.debug("🚨 Trasa przecina budynek!")
-                    return False
+                    # Oblicz długość przecięcia
+                    intersection = route_line_projected.intersection(building.geometry)
                     
-                # 2. Sprawdź minimalną odległość od budynku
+                    if hasattr(intersection, 'length'):
+                        intersection_length = intersection.length
+                    else:
+                        # Dla punktów lub multigeometry
+                        intersection_length = 0
+                    
+                    total_intersection_length += intersection_length
+                    
+                    # KLUCZOWE: Jeśli przecięcie jest dłuższe niż 10m, to jest problem
+                    if intersection_length > 10:  # 10m to maksymalny akceptowalny przecięcie
+                        dangerous_intersections += 1
+                        logger.debug(f"🚨 Długie przecięcie budynku: {intersection_length:.1f}m")
+                        
+                        # Jeśli mamy więcej niż 2 długie przecięcia, odrzuć trasę
+                        if dangerous_intersections > 2:
+                            logger.debug(f"🚨 Za dużo długich przecięć: {dangerous_intersections}")
+                            return False
+                    
+                # 2. Sprawdź minimalną odległość tylko dla bardzo bliskich budynków
                 distance_to_building = route_line_projected.distance(building.geometry)
                 if distance_to_building < min_distance:
-                    logger.debug(f"🚨 Trasa za blisko budynku: {distance_to_building:.1f}m < {min_distance}m")
-                    return False
-                    
-            logger.debug("✅ Trasa bezpieczna od budynków")
+                    # To jest OK - pozwalamy na bliskie przejścia
+                    logger.debug(f"📍 Trasa blisko budynku: {distance_to_building:.1f}m")
+            
+            # NOWE: Sprawdź całkowitą długość przecięć przez budynki
+            if total_intersection_length > 50:  # Maksymalnie 50m całkowitych przecięć
+                logger.debug(f"🚨 Za długie całkowite przecięcia: {total_intersection_length:.1f}m")
+                return False
+                        
+            logger.debug(f"✅ Trasa OK: {dangerous_intersections} długich przecięć, {total_intersection_length:.1f}m razem")
             return True
                     
         except Exception as e:
             logger.debug(f"Błąd sprawdzania bezpieczeństwa trasy: {str(e)}")
-            # W przypadku błędu, zakładamy że trasa NIE jest bezpieczna (ostrożne podejście)
-            return False
+            # W przypadku błędu, zakładamy że trasa jest OK (mniej restrykcyjne)
+            return True
 
     def _find_safe_alternative_path(self, start_point: Tuple[float, float], end_point: Tuple[float, float], max_attempts: int = 10) -> Optional[List[Tuple[float, float]]]:
         """
@@ -647,9 +675,112 @@ class RouteOptimizer:
             self._nearest_point_cache[cache_key] = None
             return None
 
+    def _generate_sequential_route(self, start_point: Tuple[float, float], target_length: int, max_distance_between_stops: float = 800) -> List[Tuple[float, float]]:
+        """
+        NOWA FUNKCJA: Generuje trasę sekwencyjną - przystanki idą po kolei, bez skoków.
+        
+        Args:
+            start_point: Punkt startowy (lat, lon)
+            target_length: Docelowa liczba przystanków
+            max_distance_between_stops: Maksymalna odległość między kolejnymi przystankami (metry)
+            
+        Returns:
+            List[Tuple[float, float]]: Sekwencyjna trasa
+        """
+        valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
+        
+        # Znajdź najbliższy przystanek do punktu startowego
+        current_stop = None
+        min_distance = float('inf')
+        
+        for stop in valid_stops:
+            if (round(stop[0], 6), round(stop[1], 6)) in self.used_stops:
+                continue
+                
+            distance = self._calculate_distance(start_point, stop, is_wgs84=True)
+            if distance < min_distance:
+                min_distance = distance
+                current_stop = stop
+        
+        if current_stop is None:
+            logger.warning("Nie znaleziono dostępnego przystanku startowego")
+            return []
+        
+        route = [current_stop]
+        used_in_route = {(round(current_stop[0], 6), round(current_stop[1], 6))}
+        
+        logger.debug(f"🚀 Rozpoczynam sekwencyjną trasę od {current_stop}")
+        
+        # Buduj trasę krok po kroku, zawsze wybierając najbliższy dostępny przystanek
+        for step in range(target_length - 1):
+            best_next_stop = None
+            best_distance = float('inf')
+            
+            # Znajdź najbliższy dostępny przystanek do obecnego
+            for stop in valid_stops:
+                stop_normalized = (round(stop[0], 6), round(stop[1], 6))
+                
+                # Sprawdź czy przystanek jest dostępny
+                if (stop_normalized in self.used_stops or 
+                    stop_normalized in used_in_route):
+                    continue
+                
+                # Oblicz odległość od obecnego przystanku
+                distance = self._calculate_distance(current_stop, stop, is_wgs84=True)
+                
+                # KLUCZOWE: Sprawdź czy odległość nie jest za duża (unikamy skoków)
+                if distance > max_distance_between_stops:
+                    continue
+                
+                # Sprawdź czy to jest lepszy kandydat
+                if distance < best_distance:
+                    best_distance = distance
+                    best_next_stop = stop
+            
+            # Jeśli nie znaleziono dobrego kandydata w normalnym zasięgu, spróbuj większy zasięg
+            if best_next_stop is None and step < 3:  # Tylko dla pierwszych przystanków
+                logger.debug(f"Nie znaleziono przystanku w zasięgu {max_distance_between_stops}m, próbuję {max_distance_between_stops * 1.5}m")
+                
+                for stop in valid_stops:
+                    stop_normalized = (round(stop[0], 6), round(stop[1], 6))
+                    
+                    if (stop_normalized in self.used_stops or 
+                        stop_normalized in used_in_route):
+                        continue
+                    
+                    distance = self._calculate_distance(current_stop, stop, is_wgs84=True)
+                    
+                    if distance <= max_distance_between_stops * 1.5 and distance < best_distance:
+                        best_distance = distance
+                        best_next_stop = stop
+            
+            # Jeśli nadal nie ma kandydata, przerwij
+            if best_next_stop is None:
+                logger.debug(f"Nie znaleziono kolejnego przystanku po {step + 1} przystankach")
+                break
+            
+            # Dodaj przystanek do trasy
+            route.append(best_next_stop)
+            used_in_route.add((round(best_next_stop[0], 6), round(best_next_stop[1], 6)))
+            current_stop = best_next_stop
+            
+            logger.debug(f"➡️  Krok {step + 1}: dodano {best_next_stop}, odległość {best_distance:.0f}m")
+            
+            # Sprawdź czy trasa nie stała się za długa (zabezpieczenie)
+            total_length = sum(
+                self._calculate_distance(route[i], route[i+1], is_wgs84=True) 
+                for i in range(len(route)-1)
+            )
+            if total_length > 10000:  # 10km maximum
+                logger.debug(f"Trasa osiągnęła 10km - zatrzymuję na {len(route)} przystankach")
+                break
+        
+        logger.debug(f"🏁 Zakończono sekwencyjną trasę: {len(route)} przystanków")
+        return route
+
     def _create_connected_route(self, stops: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         """
-        Tworzy połączoną trasę z listy przystanków używając rzeczywistych dróg.
+        ULEPSZONE: Tworzy połączoną trasę z kontrolą odległości między przystankami.
         
         Args:
             stops: Lista przystanków (lat, lon) w WGS84
@@ -666,6 +797,22 @@ class RouteOptimizer:
             current_stop = stops[i]
             next_stop = stops[i + 1]
             
+            # KONTROLA: Sprawdź odległość między przystankami
+            distance = self._calculate_distance(current_stop, next_stop, is_wgs84=True)
+            
+            # Jeśli odległość jest za duża, to znaczy że mamy "skok"
+            if distance > 1500:  # 1.5km to maksymalna sensowna odległość
+                logger.warning(f"⚠️ WYKRYTO SKOK: {distance:.0f}m między {current_stop} a {next_stop}")
+                
+                # Spróbuj znaleźć punkt pośredni
+                intermediate_points = self._find_intermediate_stops(current_stop, next_stop, max_gap=800)
+                
+                if intermediate_points:
+                    logger.debug(f"✅ Dodano {len(intermediate_points)} punktów pośrednich")
+                    connected_route.extend(intermediate_points)
+                else:
+                    logger.debug(f"❌ Nie znaleziono punktów pośrednich - pozostawiam bezpośrednie połączenie")
+            
             # Znajdź ścieżkę między bieżącym a następnym przystankiem
             path = self._find_connecting_path(current_stop, next_stop)
             
@@ -678,70 +825,73 @@ class RouteOptimizer:
         
         return connected_route
 
-    def _ensure_unique_stops(self, route: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    def _find_intermediate_stops(self, start: Tuple[float, float], end: Tuple[float, float], max_gap: float = 800) -> List[Tuple[float, float]]:
         """
-        Zapewnia unikatowość przystanków w trasie i globalnie w systemie.
+        NOWA FUNKCJA: Znajduje przystanki pośrednie między dwoma odległymi przystankami.
         
         Args:
-            route: Lista punktów trasy
+            start: Przystanek początkowy (lat, lon)
+            end: Przystanek końcowy (lat, lon)
+            max_gap: Maksymalna dozwolona przerwa między przystankami (metry)
             
         Returns:
-            List[Tuple[float, float]]: Trasa z unikatowymi przystankami
+            List[Tuple[float, float]]: Lista przystanków pośrednich
         """
-        # Konwertuj przystanki do tupli z zaokrąglonymi współrzędnymi dla porównania
-        def normalize_coords(lat, lon):
-            return (round(lat, 6), round(lon, 6))
-        
-        unique_route = []
-        seen_in_route = set()
-        
-        for point in route:
-            normalized = normalize_coords(point[0], point[1])
-            
-            # Sprawdź czy punkt już występuje w tej trasie
-            if normalized in seen_in_route:
-                continue
-                
-            # Sprawdź czy punkt jest już używany w innej trasie w systemie
-            if normalized in self.used_stops:
-                # Znajdź alternatywny przystanek w pobliżu
-                alternative = self._find_alternative_stop(point, min_distance=50)
-                if alternative:
-                    normalized_alt = normalize_coords(alternative[0], alternative[1])
-                    if normalized_alt not in seen_in_route and normalized_alt not in self.used_stops:
-                        unique_route.append(alternative)
-                        seen_in_route.add(normalized_alt)
-                # Jeśli nie znaleziono alternatywy, pomijamy ten punkt
-            else:
-                unique_route.append(point)
-                seen_in_route.add(normalized)
-                
-        return unique_route
-
-    def _find_alternative_stop(self, original_stop: Tuple[float, float], min_distance: float = 50) -> Optional[Tuple[float, float]]:
-        """
-        Znajduje alternatywny przystanek w pobliżu oryginalnego.
-        
-        Args:
-            original_stop: Oryginalny przystanek (lat, lon)
-            min_distance: Minimalna odległość od oryginalnego przystanku w metrach
-            
-        Returns:
-            Optional[Tuple[float, float]]: Alternatywny przystanek lub None
-        """
-        # Sprawdź wszystkie dostępne przystanki
         valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
         
+        # Znajdź przystanki które są "na drodze" między start i end
+        intermediate_candidates = []
+        
         for stop in valid_stops:
-            distance = self._calculate_distance(original_stop, stop, is_wgs84=True)
-            normalized = (round(stop[0], 6), round(stop[1], 6))
+            # Sprawdź czy przystanek nie jest już używany
+            stop_normalized = (round(stop[0], 6), round(stop[1], 6))
+            if stop_normalized in self.used_stops:
+                continue
             
-            # Sprawdź czy przystanek jest w odpowiedniej odległości i nie jest używany
-            if (min_distance <= distance <= min_distance * 3 and 
-                normalized not in self.used_stops):
-                return stop
+            # Sprawdź czy przystanek nie jest jednym z końców
+            if (abs(stop[0] - start[0]) < 0.0001 and abs(stop[1] - start[1]) < 0.0001) or \
+               (abs(stop[0] - end[0]) < 0.0001 and abs(stop[1] - end[1]) < 0.0001):
+                continue
+            
+            # Sprawdź czy przystanek jest "między" start i end
+            dist_start = self._calculate_distance(start, stop, is_wgs84=True)
+            dist_end = self._calculate_distance(stop, end, is_wgs84=True)
+            direct_dist = self._calculate_distance(start, end, is_wgs84=True)
+            
+            # Jeśli suma odległości jest zbliżona do bezpośredniej odległości, 
+            # znaczy to że przystanek jest "na linii"
+            total_via_stop = dist_start + dist_end
+            
+            if total_via_stop <= direct_dist * 1.2:  # 20% tolerancji na zakręty
+                intermediate_candidates.append({
+                    'stop': stop,
+                    'distance_from_start': dist_start,
+                    'total_detour': total_via_stop - direct_dist
+                })
+        
+        # Sortuj kandydatów według odległości od startu
+        intermediate_candidates.sort(key=lambda x: x['distance_from_start'])
+        
+        # Wybierz przystanki które zapewniają odpowiednie odległości
+        selected = []
+        last_position = start
+        
+        for candidate in intermediate_candidates:
+            stop = candidate['stop']
+            distance_from_last = self._calculate_distance(last_position, stop, is_wgs84=True)
+            
+            # Jeśli odległość od ostatniego przystanku jest w odpowiednim zakresie
+            if 300 <= distance_from_last <= max_gap:
+                selected.append(stop)
+                last_position = stop
                 
-        return None
+                # Sprawdź czy już jesteśmy blisko końca
+                distance_to_end = self._calculate_distance(stop, end, is_wgs84=True)
+                if distance_to_end <= max_gap:
+                    break
+        
+        logger.debug(f"🔗 Znaleziono {len(selected)} przystanków pośrednich między {start} a {end}")
+        return selected
 
     def optimize_route(
         self,
@@ -860,7 +1010,7 @@ class RouteOptimizer:
         num_stops: int
     ) -> List[Tuple[float, float]]:
         """
-        Generuje losową trasę między punktami startowym i końcowym.
+        ULEPSZONE: Generuje trasę z preferencją dla sekwencyjnego routingu.
         
         Args:
             start_point: Punkt początkowy (lat, lon)
@@ -870,23 +1020,45 @@ class RouteOptimizer:
         Returns:
             List[Tuple[float, float]]: Wygenerowana trasa
         """
+        # 70% szans na sekwencyjną trasę, 30% na oryginalną metodę
+        if random.random() < 0.7:
+            logger.debug("🎯 Generuję trasę sekwencyjną (bez skoków)")
+            
+            # Użyj nowej sekwencyjnej metody
+            sequential_route = self._generate_sequential_route(
+                start_point=start_point,
+                target_length=num_stops,
+                max_distance_between_stops=800  # Maksymalnie 800m między przystankami
+            )
+            
+            if len(sequential_route) >= 2:
+                # Utwórz połączoną trasę z kontrolą skoków
+                connected_route = self._create_connected_route(sequential_route)
+                logger.debug(f"✅ Sekwencyjna trasa: {len(sequential_route)} przystanków -> {len(connected_route)} punktów")
+                return connected_route
+            else:
+                logger.debug("❌ Sekwencyjna metoda nie powiodła się - fallback do oryginalnej")
+        
+        # Fallback do oryginalnej metody (może dawać skoki)
+        logger.debug("🔄 Używam oryginalnej metody generowania")
+        
         try:
-            # Znajdź najbliższe węzły w grafie - używamy cache jeśli punkty się nie zmieniły
+            # Oryginalny kod z dodatkową kontrolą odległości
             start_node_in_graph = None
             end_node_in_graph = None
             min_start_dist = float('inf')
             min_end_dist = float('inf')
             
-            # Konwertuj punkty start i end do EPSG:2180 raz na początku
+            # Konwertuj punkty start i end do EPSG:2180
             try:
                 start_gdf = gpd.GeoDataFrame(
-                    geometry=[Point(start_point[1], start_point[0])],  # (lon, lat)
+                    geometry=[Point(start_point[1], start_point[0])],
                     crs="EPSG:4326"
                 ).to_crs(epsg=2180)
                 start_epsg2180 = (start_gdf.geometry.x[0], start_gdf.geometry.y[0])
                 
                 end_gdf = gpd.GeoDataFrame(
-                    geometry=[Point(end_point[1], end_point[0])],  # (lon, lat)
+                    geometry=[Point(end_point[1], end_point[0])],
                     crs="EPSG:4326"
                 ).to_crs(epsg=2180)
                 end_epsg2180 = (end_gdf.geometry.x[0], end_gdf.geometry.y[0])
@@ -894,12 +1066,11 @@ class RouteOptimizer:
                 logger.error(f"Błąd konwersji punktów do EPSG:2180: {str(e)}")
                 return [start_point, end_point]
             
-            # Optymalizacja: przerwij wyszukiwanie gdy znajdziemy bardzo blisko węzły
+            # Znajdź najbliższe węzły w grafie
             found_good_start = False
             found_good_end = False
             
             for node in self.street_graph.nodes():
-                # Jeśli już znaleźliśmy dobre węzły, nie szukaj dalej
                 if found_good_start and found_good_end:
                     break
                     
@@ -908,7 +1079,6 @@ class RouteOptimizer:
                     if start_dist < min_start_dist and start_dist > 0:
                         min_start_dist = start_dist
                         start_node_in_graph = node
-                        # Jeśli znaleziono bardzo blisko (< 50m), to wystarczy
                         if start_dist < 50:
                             found_good_start = True
                 
@@ -917,7 +1087,6 @@ class RouteOptimizer:
                     if end_dist < min_end_dist and end_dist > 0:
                         min_end_dist = end_dist
                         end_node_in_graph = node
-                        # Jeśli znaleziono bardzo blisko (< 50m), to wystarczy
                         if end_dist < 50:
                             found_good_end = True
             
@@ -937,14 +1106,13 @@ class RouteOptimizer:
                 logger.warning("Nie znaleziono ścieżki między punktami")
                 return [start_point, end_point]
             
-            # Optymalizacja: jeśli ścieżka jest krótka, konwertuj tylko wybrane punkty
+            # Konwertuj z powrotem do WGS84 z kontrolą odległości
             if len(path) <= num_stops:
-                # Konwertuj wszystkie punkty
                 wgs84_path = []
                 for node in path:
                     try:
                         node_gdf = gpd.GeoDataFrame(
-                            geometry=[Point(node[0], node[1])],  # (x, y) w EPSG:2180
+                            geometry=[Point(node[0], node[1])],
                             crs="EPSG:2180"
                         ).to_crs(epsg=4326)
                         lat = node_gdf.geometry.y[0]
@@ -953,18 +1121,20 @@ class RouteOptimizer:
                     except Exception as e:
                         logger.warning(f"Błąd konwersji węzła {node} do WGS84: {str(e)}")
                         return [start_point, end_point]
-                return wgs84_path
+                
+                # KONTROLA SKOKÓW w oryginalnej trasie
+                filtered_path = self._filter_jumps_from_path(wgs84_path)
+                return filtered_path
             else:
-                # Wybierz równomiernie rozłożone punkty PRZED konwersją
+                # Wybierz równomiernie rozłożone punkty z kontrolą skoków
                 indices = np.linspace(0, len(path) - 1, num_stops, dtype=int)
                 selected_nodes = [path[i] for i in indices]
                 
-                # Konwertuj tylko wybrane punkty
                 wgs84_path = []
                 for node in selected_nodes:
                     try:
                         node_gdf = gpd.GeoDataFrame(
-                            geometry=[Point(node[0], node[1])],  # (x, y) w EPSG:2180
+                            geometry=[Point(node[0], node[1])],
                             crs="EPSG:2180"
                         ).to_crs(epsg=4326)
                         lat = node_gdf.geometry.y[0]
@@ -973,11 +1143,186 @@ class RouteOptimizer:
                     except Exception as e:
                         logger.warning(f"Błąd konwersji węzła {node} do WGS84: {str(e)}")
                         return [start_point, end_point]
-                return wgs84_path
+                
+                # KONTROLA SKOKÓW w wybranej trasie
+                filtered_path = self._filter_jumps_from_path(wgs84_path)
+                return filtered_path
             
         except Exception as e:
             logger.error(f"Błąd podczas generowania trasy: {str(e)}")
             return [start_point, end_point]
+
+    def _filter_jumps_from_path(self, path: List[Tuple[float, float]], max_jump: float = 1200) -> List[Tuple[float, float]]:
+        """
+        NOWA FUNKCJA: Filtruje "skoki" z trasy - usuwa punkty które są za daleko od poprzedniego.
+        
+        Args:
+            path: Ścieżka do sprawdzenia
+            max_jump: Maksymalna dozwolona odległość między punktami (metry)
+            
+        Returns:
+            List[Tuple[float, float]]: Przefiltrowana ścieżka bez skoków
+        """
+        if len(path) <= 1:
+            return path
+            
+        filtered_path = [path[0]]  # Zawsze zachowaj pierwszy punkt
+        
+        for i in range(1, len(path)):
+            current_point = path[i]
+            last_added_point = filtered_path[-1]
+            
+            distance = self._calculate_distance(last_added_point, current_point, is_wgs84=True)
+            
+            if distance <= max_jump:
+                # Punkt jest blisko - dodaj go
+                filtered_path.append(current_point)
+                logger.debug(f"✅ Punkt OK: {distance:.0f}m")
+            else:
+                # Punkt jest za daleko - spróbuj znaleźć punkt pośredni
+                logger.debug(f"⚠️ WYKRYTO SKOK: {distance:.0f}m > {max_jump}m")
+                
+                intermediate = self._find_intermediate_stops(
+                    last_added_point, 
+                    current_point, 
+                    max_gap=max_jump
+                )
+                
+                if intermediate:
+                    filtered_path.extend(intermediate)
+                    filtered_path.append(current_point)
+                    logger.debug(f"✅ Dodano {len(intermediate)} punktów pośrednich")
+                else:
+                    # Jeśli nie ma punktów pośrednich, pomiń ten punkt
+                    logger.debug(f"❌ Pomijam punkt - za daleko i brak alternatywy")
+        
+        logger.debug(f"🔍 Filtrowanie skoków: {len(path)} -> {len(filtered_path)} punktów")
+        return filtered_path
+
+    def optimize_multiple_routes_no_jumps(self, num_routes: int = 3, time_limit_minutes: int = 15) -> List[Tuple[List[Tuple[float, float]], float]]:
+        """
+        NOWA FUNKCJA: Optymalizacja tras z gwarancją braku skoków.
+        
+        Args:
+            num_routes: Liczba tras do optymalizacji
+            time_limit_minutes: Limit czasowy w minutach
+            
+        Returns:
+            List[Tuple[List[Tuple[float, float]], float]]: Lista tras bez skoków
+        """
+        routes = []
+        
+        logger.info(f"🚫 Optymalizacja {num_routes} tras BEZ SKOKÓW:")
+        logger.info(f"   ⏰ Limit czasu: {time_limit_minutes} min")
+        logger.info(f"   🎯 Maksymalna odległość między przystankami: 800m")
+        logger.info(f"   🔗 Automatyczne dodawanie punktów pośrednich")
+        
+        start_total = time.time()
+        
+        for route_idx in range(num_routes):
+            route_start = time.time()
+            logger.info(f"🚊 Optymalizacja trasy {route_idx + 1}/{num_routes}")
+            
+            # Sprawdź limit czasu
+            elapsed_total = time.time() - start_total
+            if elapsed_total > time_limit_minutes * 60:
+                logger.warning(f"⏰ Przekroczono limit czasu ({time_limit_minutes} min)")
+                break
+            
+            # Generuj sekwencyjną trasę
+            attempts = 0
+            max_attempts = 5
+            
+            while attempts < max_attempts:
+                try:
+                    # Wybierz losowy punkt startowy
+                    valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
+                    available_starts = [stop for stop in valid_stops 
+                                      if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
+                    
+                    if not available_starts:
+                        logger.warning("Brak dostępnych przystanków startowych")
+                        break
+                    
+                    start_point = random.choice(available_starts)
+                    
+                    # Generuj sekwencyjną trasę
+                    target_length = random.randint(4, 10)  # 4-10 przystanków
+                    
+                    sequential_route = self._generate_sequential_route(
+                        start_point=start_point,
+                        target_length=target_length,
+                        max_distance_between_stops=800  # Gwarancja braku skoków
+                    )
+                    
+                    if len(sequential_route) >= 3:  # Minimum 3 przystanki
+                        # Sprawdź czy trasa nie ma skoków
+                        has_jumps = self._check_for_jumps(sequential_route, max_distance=800)
+                        
+                        if not has_jumps:
+                            # Utwórz połączoną trasę
+                            connected_route = self._create_connected_route(sequential_route)
+                            
+                            # Sprawdź czy spełnia wszystkie wymagania
+                            if self._is_valid_route(connected_route, is_simplified=False):
+                                # Oblicz ocenę
+                                score = self._evaluate_route(connected_route)
+                                
+                                routes.append((connected_route, score))
+                                
+                                # Oznacz przystanki jako używane
+                                for stop in sequential_route:
+                                    normalized = (round(stop[0], 6), round(stop[1], 6))
+                                    self.used_stops.add(normalized)
+                                
+                                route_time = time.time() - route_start
+                                logger.info(f"✅ Trasa {route_idx + 1} gotowa w {route_time:.1f}s, wynik: {score:.3f}")
+                                logger.info(f"   📊 {len(sequential_route)} przystanków, bez skoków")
+                                break
+                            else:
+                                logger.debug(f"Trasa nie spełnia ograniczeń (próba {attempts + 1})")
+                        else:
+                            logger.debug(f"Wykryto skoki w trasie (próba {attempts + 1})")
+                    else:
+                        logger.debug(f"Za mało przystanków: {len(sequential_route)} (próba {attempts + 1})")
+                
+                except Exception as e:
+                    logger.warning(f"Błąd w próbie {attempts + 1}: {e}")
+                
+                attempts += 1
+            
+            if attempts >= max_attempts:
+                logger.warning(f"❌ Nie udało się utworzyć trasy {route_idx + 1} bez skoków")
+        
+        total_time = time.time() - start_total
+        
+        logger.info(f"🏁 Zakończono w {total_time:.1f}s")
+        logger.info(f"📊 Znaleziono {len(routes)}/{num_routes} tras bez skoków")
+        
+        return routes
+
+    def _check_for_jumps(self, route: List[Tuple[float, float]], max_distance: float = 800) -> bool:
+        """
+        NOWA FUNKCJA: Sprawdza czy trasa zawiera "skoki" (zbyt duże odległości między przystankami).
+        
+        Args:
+            route: Trasa do sprawdzenia
+            max_distance: Maksymalna dozwolona odległość między przystankami (metry)
+            
+        Returns:
+            bool: True jeśli wykryto skoki
+        """
+        if len(route) < 2:
+            return False
+            
+        for i in range(len(route) - 1):
+            distance = self._calculate_distance(route[i], route[i + 1], is_wgs84=True)
+            
+            if distance > max_distance:
+                logger.debug(f"🚨 WYKRYTO SKOK: {distance:.0f}m między {route[i]} a {route[i + 1]}")
+                return True
+        
+        return False
 
     def _calculate_angle(self, p1: Tuple[float, float], p2: Tuple[float, float], p3: Tuple[float, float]) -> float:
         """Oblicza kąt między trzema punktami."""
@@ -1064,65 +1409,17 @@ class RouteOptimizer:
     
     def _check_collision_with_buildings(self, route: List[Tuple[float, float]]) -> bool:
         """
-        Sprawdza kolizje z budynkami - czy trasa nie przecina budynków i zachowuje minimalną odległość.
-        ULEPSZONE: Dodano bardziej szczegółowe sprawdzanie i logging.
+        ULEPSZONE: Sprawdza kolizje z budynkami - BARDZIEJ ELASTYCZNE.
+        Używa nowej logiki z _is_route_safe_from_buildings.
         
         Args:
             route: Trasa do sprawdzenia
             
         Returns:
-            bool: True jeśli wykryto kolizję (trasa przecina budynki lub jest za blisko)
+            bool: True jeśli wykryto POWAŻNĄ kolizję (długie przecięcia)
         """
-        if self.buildings_df is None or len(route) < 2:
-            return False
-            
-        try:
-            # Konwertuj trasę do EPSG:2180 dla precyzyjnych obliczeń w metrach
-            route_points = []
-            for lat, lon in route:
-                point_gdf = gpd.GeoDataFrame(
-                    geometry=[Point(lon, lat)], crs="EPSG:4326"
-                ).to_crs(epsg=2180)
-                route_points.append((point_gdf.geometry.x[0], point_gdf.geometry.y[0]))
-            
-            route_line_projected = LineString(route_points)
-            
-            # ULEPSZONE: Używaj parametru z constraints, ale minimum 3m
-            min_distance = max(3, self.constraints.min_distance_from_buildings)
-            
-            collision_count = 0
-            too_close_count = 0
-            
-            # Sprawdź czy trasa nie przecina żadnego budynku bezpośrednio
-            for idx, building in self.buildings_projected.iterrows():
-                # 1. KRYTYCZNE: Sprawdź czy trasa przecina budynek bezpośrednio
-                if route_line_projected.intersects(building.geometry):
-                    collision_count += 1
-                    if collision_count <= 3:  # Log tylko pierwsze 3 kolizje
-                        logger.debug(f"🚨 KOLIZJA #{collision_count}: Trasa przecina budynek (ID: {idx})")
-                    
-                    # Przerwij po pierwszej kolizji - to jest krytyczne
-                    return True
-                    
-                # 2. WAŻNE: Sprawdź minimalną odległość od budynku
-                distance_to_building = route_line_projected.distance(building.geometry)
-                if distance_to_building < min_distance:
-                    too_close_count += 1
-                    if too_close_count <= 3:  # Log tylko pierwsze 3 problemy
-                        logger.debug(f"⚠️ ZA BLISKO #{too_close_count}: Trasa {distance_to_building:.1f}m od budynku (min: {min_distance}m)")
-                    
-                    # Za duża bliskość też dyskwalifikuje trasę
-                    return True
-                    
-            # Jeśli dotarliśmy tutaj, trasa jest bezpieczna
-            logger.debug(f"✅ Trasa bezpieczna od {len(self.buildings_projected)} budynków (min. dystans: {min_distance}m)")
-            return False
-                    
-        except Exception as e:
-            logger.warning(f"Błąd podczas sprawdzania kolizji z budynkami: {str(e)}")
-            # ULEPSZONE: W przypadku błędu, zakładamy KOLIZJĘ (bezpieczniejsze podejście)
-            logger.warning("⚠️ Zakładam kolizję z powodu błędu sprawdzania")
-            return True
+        # Używaj nowej, bardziej elastycznej metody
+        return not self._is_route_safe_from_buildings(route, min_distance=2.0)
 
     def _calculate_distance(self, point1: Tuple[float, float], point2: Tuple[float, float], is_wgs84: bool = True) -> float:
         """
@@ -2263,759 +2560,123 @@ class RouteOptimizer:
         
         return routes
     
-    def _precompute_density_cache(self):
-        """Prekomputuje cache gęstości dla najważniejszych przystanków."""
-        if not hasattr(self, '_density_cache'):
-            self._density_cache = {}
-            
-        logger.debug("📊 Cachowanie gęstości TOP przystanków...")
-        
-        try:
-            # Weź TOP 30 przystanków według gęstości (wystarczy dla większości tras)
-            top_stops = self._find_top_density_stops(top_n=30)
-            
-            for stop in top_stops:
-                cache_key = (round(stop[0], 5), round(stop[1], 5))
-                if cache_key not in self._density_cache:
-                    try:
-                        # POPRAWKA: Używaj prostszego obliczania gęstości
-                        density = self._calculate_simple_density(stop[0], stop[1], radius=300)
-                        self._density_cache[cache_key] = density
-                    except Exception as e:
-                        logger.debug(f"Błąd obliczania gęstości dla {stop}: {e}")
-                        # Fallback - minimalna gęstość
-                        self._density_cache[cache_key] = 0.1
-            
-            logger.debug(f"   Zacachowano {len(self._density_cache)} punktów gęstości")
-            
-        except Exception as e:
-            logger.warning(f"Błąd prekomputacji gęstości: {e}")
-            # Twórz minimalny cache
-            self._density_cache = {(50.0647, 19.9450): 0.5}  # Centrum Krakowa
-    
-    def _calculate_simple_density(self, lat: float, lon: float, radius: float = 300) -> float:
-        """Proste obliczanie gęstości bez konwersji CRS."""
-        try:
-            # Konwertuj do EPSG:2180 raz
-            point_gdf = gpd.GeoDataFrame(
-                geometry=[Point(lon, lat)], crs="EPSG:4326"
-            ).to_crs(epsg=2180)
-            point_projected = point_gdf.geometry[0]
-            
-            # Znajdź budynki w promieniu
-            buildings_nearby = self.buildings_projected[
-                self.buildings_projected.geometry.distance(point_projected) <= radius
-            ]
-            
-            # Prosta gęstość - liczba budynków / powierzchnia
-            if len(buildings_nearby) > 0:
-                density = len(buildings_nearby) / (np.pi * radius**2) * 1000000  # na km²
-                return density
-            else:
-                return 0.1  # Minimalna gęstość
-                
-        except Exception as e:
-            logger.debug(f"Błąd prostego obliczania gęstości: {e}")
-            return 0.1  # Fallback
-    
-    def _precompute_valid_connections(self):
-        """Prekomputuje prawidłowe połączenia między przystankami."""
-        if not hasattr(self, '_valid_connections_cache'):
-            self._valid_connections_cache = {}
-            
-        logger.debug("🔗 Cachowanie prawidłowych połączeń...")
-        
-        valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
-        
-        # Sprawdź połączenia między najbliższymi przystankami (nie wszystkimi!)
-        connection_count = 0
-        max_connections = 500  # Limit dla przyspieszenia
-        
-        for i, stop1 in enumerate(valid_stops[:50]):  # Tylko pierwsze 50
-            for stop2 in valid_stops[:50]:
-                if connection_count >= max_connections:
-                    break
-                    
-                if stop1 == stop2:
-                    continue
-                    
-                distance = self._calculate_distance(stop1, stop2, is_wgs84=True)
-                
-                # Cache tylko prawidłowe odległości
-                if self.constraints.min_distance_between_stops <= distance <= self.constraints.max_distance_between_stops:
-                    key = (round(stop1[0], 5), round(stop1[1], 5), round(stop2[0], 5), round(stop2[1], 5))
-                    self._valid_connections_cache[key] = distance
-                    connection_count += 1
-            
-            if connection_count >= max_connections:
-                break
-        
-        logger.debug(f"   Zacachowano {len(self._valid_connections_cache)} prawidłowych połączeń")
-    
-    def _optimize_intelligent_single_route(self, max_time_seconds: float, route_number: int) -> Tuple[List[Tuple[float, float]], float]:
+    def _ensure_unique_stops(self, route: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         """
-        Inteligentna optymalizacja pojedynczej trasy z wykorzystaniem heurystyk.
-        """
-        start_time = time.time()
-        
-        # KROK 1: Generuj populację z wykorzystaniem smart heuristics
-        try:
-            population = self._generate_intelligent_population()
-            
-            if not population:
-                logger.warning(f"Nie udało się utworzyć inteligentnej populacji - fallback")
-                return self._generate_backup_valid_route(), 0.1
-                
-        except Exception as e:
-            logger.warning(f"Błąd tworzenia inteligentnej populacji: {e} - fallback")
-            return self._generate_backup_valid_route(), 0.1
-        
-        best_route = None
-        best_score = float('-inf')
-        generations_without_improvement = 0
-        patience = 2  # Bardzo agresywny early stopping
-        
-        for generation in range(self.generations):
-            # Sprawdź limit czasu
-            if time.time() - start_time > max_time_seconds:
-                logger.debug(f"⏰ Limit czasu {max_time_seconds:.1f}s w pokoleniu {generation}")
-                break
-            
-            # SZYBKA ocena populacji z wykorzystaniem cache
-            try:
-                scores = []
-                for route in population:
-                    if self._fast_validate_route(route):  # Szybka prewalidacja
-                        score = self._fast_evaluate_route(route)  # Szybka ocena z cache
-                        scores.append(score)
-                    else:
-                        scores.append(float('-inf'))  # Nieprawidłowa trasa
-                        
-            except Exception as e:
-                logger.warning(f"Błąd oceny populacji: {e}")
-                break
-            
-            # Sprawdź poprawę
-            if scores:
-                max_score_idx = np.argmax(scores)
-                current_best_score = scores[max_score_idx]
-                
-                if current_best_score > best_score:
-                    best_score = current_best_score
-                    best_route = population[max_score_idx]
-                    generations_without_improvement = 0
-                    logger.debug(f"🎯 Poprawa T{route_number} gen{generation + 1}: {best_score:.3f}")
-                else:
-                    generations_without_improvement += 1
-            
-            # Bardzo agresywny early stopping
-            if generations_without_improvement >= patience:
-                logger.debug(f"⏹️ Early stopping T{route_number} po {generation + 1} pokoleniach")
-                break
-            
-            # INTELIGENTNA ewolucja - tylko najlepsze
-            try:
-                # Weź TOP 25%
-                top_quarter = max(1, len(population) // 4)
-                if scores:
-                    selected_indices = np.argsort(scores)[-top_quarter:]
-                    selected = [population[i] for i in selected_indices if scores[i] > float('-inf')]
-                    
-                    if selected:
-                        # Nowa populacja = najlepsze + inteligentne mutacje
-                        new_population = selected.copy()
-                        
-                        # Dodaj inteligentne mutacje
-                        while len(new_population) < self.population_size and selected:
-                            parent = random.choice(selected)
-                            mutated = self._intelligent_mutate(parent)
-                            if mutated and self._fast_validate_route(mutated):
-                                new_population.append(mutated)
-                            else:
-                                # Fallback - duplikuj rodzica
-                                new_population.append(parent)
-                        
-                        population = new_population
-                    else:
-                        # Jeśli nie ma dobrych tras, przerwij
-                        break
-                        
-            except Exception as e:
-                logger.warning(f"Błąd ewolucji: {e}")
-                break
-        
-        # Sprawdź czy znaleziona trasa spełnia WSZYSTKIE wymagania
-        if best_route is None or not self._validate_all_requirements(best_route):
-            logger.debug(f"Znaleziona trasa nie spełnia wymagań - generuję backup")
-            return self._generate_backup_valid_route(), 0.1
-            
-        return best_route, best_score
-    
-    def _generate_intelligent_population(self) -> List[List[Tuple[float, float]]]:
-        """Generuje populację używając inteligentnych heurystyk."""
-        population = []
-        
-        try:
-            # Użyj cache najlepszych przystanków
-            if hasattr(self, '_density_cache') and self._density_cache:
-                top_stops = list(self._density_cache.keys())
-                # Konwertuj z powrotem do (lat, lon)
-                top_stops_coords = [(lat, lon) for lat, lon in top_stops]
-            else:
-                # Fallback - TOP przystanki
-                try:
-                    top_stops_coords = self._find_top_density_stops(top_n=20)
-                except Exception as e:
-                    logger.warning(f"Błąd znajdowania TOP przystanków: {e}")
-                    # Ultimate fallback - wszystkie przystanki
-                    top_stops_coords = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
-            
-            # Filtruj dostępne przystanki
-            available_stops = [
-                stop for stop in top_stops_coords 
-                if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops
-            ]
-            
-            if len(available_stops) < 3:
-                logger.warning("Za mało dostępnych przystanków dla inteligentnej populacji")
-                # Fallback - użyj wszystkie dostępne przystanki
-                all_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
-                available_stops = [
-                    stop for stop in all_stops 
-                    if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops
-                ]
-                
-                if len(available_stops) < 3:
-                    logger.error("Krytyczny brak przystanków!")
-                    return []
-            
-            # Generuj populację z lepszym error handling
-            successful_routes = 0
-            attempts = 0
-            max_attempts = self.population_size * 5
-            
-            while successful_routes < self.population_size and attempts < max_attempts:
-                try:
-                    # Generuj trasę z kontrolowanymi odległościami używając najlepszych przystanków
-                    route = self._generate_simple_intelligent_route(available_stops)
-                    if route and len(route) >= 2:
-                        population.append(route)
-                        successful_routes += 1
-                        
-                except Exception as e:
-                    logger.debug(f"Błąd generowania inteligentnej trasy: {e}")
-                
-                attempts += 1
-            
-            logger.debug(f"Wygenerowano {len(population)} tras inteligentnych w {attempts} próbach")
-            
-        except Exception as e:
-            logger.warning(f"Krytyczny błąd generowania inteligentnej populacji: {e}")
-            return []
-        
-        return population
-    
-    def _generate_simple_intelligent_route(self, available_stops: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Generuje prostą trasę z podstawowymi heurystykami."""
-        if len(available_stops) < 2:
-            return None
-            
-        # Prostszy algorytm - weź 3-8 losowe przystanki i sprawdź odległości
-        target_length = random.randint(3, 8)  # Dłuższe trasy (zwiększone z 4)
-        
-        try:
-            # Wybierz losowe przystanki
-            selected_stops = random.sample(available_stops, min(target_length, len(available_stops)))
-            
-            # Sprawdź czy odległości są sensowne
-            valid_route = True
-            for i in range(len(selected_stops) - 1):
-                distance = self._calculate_distance(selected_stops[i], selected_stops[i + 1], is_wgs84=True)
-                if not (200 <= distance <= 1500):  # Bardziej liberalne ograniczenia
-                    valid_route = False
-                    break
-            
-            if valid_route:
-                # Stwórz połączoną trasę
-                return self._create_connected_route(selected_stops)
-            else:
-                return None
-                
-        except Exception as e:
-            logger.debug(f"Błąd generowania prostej inteligentnej trasy: {e}")
-            return None
-    
-    def _get_cached_distance(self, stop1: Tuple[float, float], stop2: Tuple[float, float]) -> float:
-        """Pobiera odległość z cache lub oblicza ją."""
-        key = (round(stop1[0], 5), round(stop1[1], 5), round(stop2[0], 5), round(stop2[1], 5))
-        
-        if hasattr(self, '_valid_connections_cache') and key in self._valid_connections_cache:
-            return self._valid_connections_cache[key]
-        else:
-            return self._calculate_distance(stop1, stop2, is_wgs84=True)
-    
-    def _fast_validate_route(self, route: List[Tuple[float, float]]) -> bool:
-        """Szybka walidacja trasy - tylko najważniejsze sprawdzenia."""
-        if len(route) < 2:
-            return False
-            
-        # Sprawdź tylko podstawowe wymagania
-        total_length = self._calculate_total_length(route)
-        if not (self.constraints.min_total_length <= total_length <= self.constraints.max_total_length):
-            return False
-            
-        # Sprawdź odległości między przystankami (tylko główne)
-        route_stops = self._extract_stops_from_route(route)
-        if len(route_stops) < 2:
-            return False
-            
-        for i in range(len(route_stops) - 1):
-            dist = self._get_cached_distance(route_stops[i], route_stops[i + 1])
-            if not (self.constraints.min_distance_between_stops <= dist <= self.constraints.max_distance_between_stops):
-                return False
-        
-        return True
-    
-    def _fast_evaluate_route(self, route: List[Tuple[float, float]]) -> float:
-        """Szybka ocena trasy z wykorzystaniem cache."""
-        if not self._fast_validate_route(route):
-            return float('-inf')
-            
-        try:
-            # Użyj cache dla gęstości gdzie możliwe
-            density_score = 0
-            route_stops = self._extract_stops_from_route(route)
-            
-            for stop in route_stops:
-                cache_key = (round(stop[0], 5), round(stop[1], 5))
-                if hasattr(self, '_density_cache') and cache_key in self._density_cache:
-                    density_score += self._density_cache[cache_key]
-                else:
-                    # Fallback - proste obliczenie bez DensityCalculator
-                    try:
-                        density_score += self._calculate_simple_density(stop[0], stop[1], radius=300)
-                    except Exception as e:
-                        logger.debug(f"Błąd obliczania gęstości fallback: {e}")
-                        density_score += 0.3  # Domyślna wartość
-            
-            density_score = density_score / len(route_stops) if route_stops else 0.3
-            
-            # Szybka ocena odległości
-            try:
-                distance_score = self.calculate_distance_score(route)
-            except Exception as e:
-                logger.debug(f"Błąd obliczania distance_score: {e}")
-                distance_score = 0.5  # Domyślna wartość
-            
-            # Pomiń obliczenia kątów dla przyspieszenia (małe znaczenie)
-            angle_score = 0.8  # Zakładamy dobry wynik
-            
-            return (self.population_weight * density_score +
-                    self.distance_weight * distance_score +
-                    self.angle_weight * angle_score)
-                    
-        except Exception as e:
-            logger.debug(f"Błąd szybkiej oceny trasy: {e}")
-            return 0.3  # Minimalna ocena - lepiej niż -inf
-    
-    def _intelligent_mutate(self, route: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Inteligentna mutacja - tylko sensowne zmiany."""
-        if random.random() > self.mutation_rate:
-            return route
-            
-        route_stops = self._extract_stops_from_route(route)
-        if len(route_stops) < 2:
-            return route
-            
-        # Tylko wymiana przystanku na lepszy
-        valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
-        
-        # Wybierz losowy przystanek do wymiany
-        stop_to_replace_idx = random.randrange(len(route_stops))
-        old_stop = route_stops[stop_to_replace_idx]
-        
-        # Znajdź lepszy przystanek w pobliżu
-        candidates = []
-        for stop in valid_stops:
-            if (round(stop[0], 6), round(stop[1], 6)) in self.used_stops:
-                continue
-            if stop in route_stops:
-                continue
-                
-            # Sprawdź czy jest blisko starego przystanku
-            distance_to_old = self._calculate_distance(old_stop, stop, is_wgs84=True)
-            if distance_to_old <= 500:  # W promieniu 500m
-                # Sprawdź gęstość
-                cache_key = (round(stop[0], 5), round(stop[1], 5))
-                if hasattr(self, '_density_cache') and cache_key in self._density_cache:
-                    density = self._density_cache[cache_key]
-                    candidates.append((stop, density))
-        
-        if not candidates:
-            return route
-            
-        # Wybierz najlepszego kandydata
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        new_stop = candidates[0][0]
-        
-        # Wymień przystanek
-        new_route_stops = route_stops.copy()
-        new_route_stops[stop_to_replace_idx] = new_stop
-        
-        try:
-            return self._create_connected_route(new_route_stops)
-        except:
-            return route
-    
-    def _validate_all_requirements(self, route: List[Tuple[float, float]]) -> bool:
-        """Sprawdza czy trasa spełnia WSZYSTKIE wymagania projektowe - UPROSZCZONA WERSJA."""
-        try:
-            # 1. Podstawowa walidacja struktury
-            if not route or len(route) < 2:
-                logger.debug("Trasa pusta lub za krótka")
-                return False
-            
-            # 2. Sprawdź podstawowe odległości (nie wszystkie wymagania - za restrykcyjne)
-            route_stops = self._extract_stops_from_route(route)
-            if len(route_stops) < 2:
-                logger.debug("Za mało przystanków głównych")
-                return False
-                
-            # 3. Sprawdź czy odległości między przystankami są sensowne
-            for i in range(len(route_stops) - 1):
-                dist = self._calculate_distance(route_stops[i], route_stops[i + 1], is_wgs84=True)
-                # LIBERALNE ograniczenia - tylko sprawdź czy nie jest absurdalne
-                if not (100 <= dist <= 2000):  # 100m - 2km (bardzo liberalne)
-                    logger.debug(f"Absurdalna odległość między przystankami: {dist}m")
-                    return False
-            
-            # 4. Sprawdź długość całkowitą (tylko podstawowe sprawdzenie)
-            total_length = self._calculate_total_length(route)
-            if not (500 <= total_length <= 20000):  # 0.5km - 20km (bardzo liberalne)
-                logger.debug(f"Absurdalna długość trasy: {total_length}m")
-                return False
-            
-            # 5. Sprawdź kolizje z budynkami (tylko podstawowe)
-            try:
-                if self._check_collision_with_buildings(route):
-                    logger.debug("Kolizja z budynkami")
-                    return False
-            except Exception as e:
-                logger.debug(f"Błąd sprawdzania kolizji z budynkami: {e}")
-                # Ignoruj błędy kolizji - lepiej mieć trasę niż żadnej
-                pass
-            
-            # POMIŃ inne sprawdzenia - za restrykcyjne dla szybkiej optymalizacji
-            
-            return True
-            
-        except Exception as e:
-            logger.debug(f"Błąd walidacji: {e}")
-            return False
-    
-    def _generate_backup_valid_route(self) -> List[Tuple[float, float]]:
-        """Generuje prostą ale poprawną trasę backup."""
-        try:
-            valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
-            
-            # Filtruj dostępne przystanki
-            available_stops = [
-                stop for stop in valid_stops 
-                if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops
-            ]
-            
-            if len(available_stops) < 3:
-                logger.warning("Za mało przystanków dla backup")
-                return None
-            
-            # Weź 3 losowe przystanki i sprawdź czy można je połączyć
-            for attempt in range(50):  # Max 50 prób
-                selected = random.sample(available_stops, 3)
-                
-                # Sprawdź odległości
-                dist1 = self._calculate_distance(selected[0], selected[1], is_wgs84=True)
-                dist2 = self._calculate_distance(selected[1], selected[2], is_wgs84=True)
-                
-                if (self.constraints.min_distance_between_stops <= dist1 <= self.constraints.max_distance_between_stops and
-                    self.constraints.min_distance_between_stops <= dist2 <= self.constraints.max_distance_between_stops):
-                    
-                    # Utwórz trasę
-                    backup_route = self._create_connected_route(selected)
-                    total_length = self._calculate_total_length(backup_route)
-                    
-                    if (self.constraints.min_total_length <= total_length <= self.constraints.max_total_length and
-                        not self._check_collision_with_existing_lines(backup_route) and
-                        not self._check_collision_with_buildings(backup_route)):
-                        
-                        logger.debug(f"Utworzono backup trasę w {attempt + 1} próbach")
-                        return backup_route
-            
-            logger.warning("Nie udało się utworzyć backup trasy")
-            return None
-            
-        except Exception as e:
-            logger.warning(f"Błąd tworzenia backup trasy: {e}")
-            return None
-
-    def optimize_multiple_routes_simple_fast(self, num_routes: int = 3, max_time_seconds: int = 120) -> List[Tuple[List[Tuple[float, float]], float]]:
-        """
-        PROSTA SZYBKA optymalizacja - gwarancja znalezienia tras w 1-2 minuty.
-        Bez skomplikowanych algorytmów - tylko podstawowa funkcjonalność.
+        Zapewnia unikatowość przystanków w trasie i globalnie w systemie.
         
         Args:
-            num_routes: Liczba tras do optymalizacji  
-            max_time_seconds: Maksymalny czas w sekundach (domyślnie 120s = 2 min)
+            route: Lista punktów trasy
             
         Returns:
-            List[Tuple[List[Tuple[float, float]], float]]: Lista tras i ich ocen
+            List[Tuple[float, float]]: Trasa z unikatowymi przystankami
         """
-        routes = []
-        start_total = time.time()
+        # Konwertuj przystanki do tupli z zaokrąglonymi współrzędnymi dla porównania
+        def normalize_coords(lat, lon):
+            return (round(lat, 6), round(lon, 6))
         
-        logger.info(f"🚀 PROSTA SZYBKA optymalizacja {num_routes} tras:")
-        logger.info(f"   Maksymalny czas: {max_time_seconds}s")
-        logger.info(f"   Bez prekomputacji - tylko podstawowe generowanie tras")
+        unique_route = []
+        seen_in_route = set()
         
-        # Przygotuj listę dostępnych przystanków
+        for point in route:
+            normalized = normalize_coords(point[0], point[1])
+            
+            # Sprawdź czy punkt już występuje w tej trasie
+            if normalized in seen_in_route:
+                continue
+                
+            # Sprawdź czy punkt jest już używany w innej trasie w systemie
+            if normalized in self.used_stops:
+                # Znajdź alternatywny przystanek w pobliżu
+                alternative = self._find_alternative_stop(point, min_distance=50)
+                if alternative:
+                    normalized_alt = normalize_coords(alternative[0], alternative[1])
+                    if normalized_alt not in seen_in_route and normalized_alt not in self.used_stops:
+                        unique_route.append(alternative)
+                        seen_in_route.add(normalized_alt)
+                # Jeśli nie znaleziono alternatywy, pomijamy ten punkt
+            else:
+                unique_route.append(point)
+                seen_in_route.add(normalized)
+                
+        return unique_route
+
+    def _find_alternative_stop(self, original_stop: Tuple[float, float], min_distance: float = 50) -> Optional[Tuple[float, float]]:
+        """
+        Znajduje alternatywny przystanek w pobliżu oryginalnego.
+        
+        Args:
+            original_stop: Oryginalny przystanek (lat, lon)
+            min_distance: Minimalna odległość od oryginalnego przystanku w metrach
+            
+        Returns:
+            Optional[Tuple[float, float]]: Alternatywny przystanek lub None
+        """
+        # Sprawdź wszystkie dostępne przystanki
         valid_stops = [(row.geometry.y, row.geometry.x) for _, row in self.stops_df.iterrows()]
-        logger.info(f"   Dostępnych przystanków: {len(valid_stops)}")
         
-        for route_idx in range(num_routes):
-            route_start = time.time()
+        for stop in valid_stops:
+            distance = self._calculate_distance(original_stop, stop, is_wgs84=True)
+            normalized = (round(stop[0], 6), round(stop[1], 6))
             
-            # SPRAWDŹ LIMIT CZASU
-            if time.time() - start_total > max_time_seconds:
-                logger.warning(f"⏰ Przekroczono limit czasu {max_time_seconds}s - zatrzymuję")
-                break
+            # Sprawdź czy przystanek jest w odpowiedniej odległości i nie jest używany
+            if (min_distance <= distance <= min_distance * 3 and 
+                normalized not in self.used_stops):
+                return stop
                 
-            logger.info(f"🚊 Generuję trasę {route_idx + 1}/{num_routes}")
-            
-            # PROSTA metoda generowania trasy
-            route = self._generate_simple_working_route(valid_stops, max_attempts=100)
-            
-            if route:
-                # Prosta ocena
-                score = self._simple_route_evaluation(route)
-                routes.append((route, score))
-                
-                route_time = time.time() - route_start
-                logger.info(f"✅ Trasa {route_idx + 1} gotowa w {route_time:.1f}s, wynik: {score:.2f}")
-                
-                # Oznacz przystanki jako używane (proste sprawdzenie)
-                route_stops = self._extract_stops_from_route(route)
-                for stop in route_stops:
-                    normalized = (round(stop[0], 6), round(stop[1], 6))
-                    self.used_stops.add(normalized)
-                    
-            else:
-                logger.warning(f"❌ Nie udało się wygenerować trasy {route_idx + 1}")
-                
-                # BARDZO PROSTY fallback - po prostu weź 3 losowe przystanki
-                try:
-                    available_stops = [stop for stop in valid_stops 
-                                     if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
-                    
-                    if len(available_stops) >= 3:
-                        simple_route = random.sample(available_stops, 3)
-                        routes.append((simple_route, 0.1))  # Minimalna ocena
-                        logger.info(f"🔄 Dodano prostą fallback trasę {route_idx + 1}")
-                        
-                        # Oznacz jako używane
-                        for stop in simple_route:
-                            normalized = (round(stop[0], 6), round(stop[1], 6))
-                            self.used_stops.add(normalized)
-                            
-                except Exception as e:
-                    logger.warning(f"Błąd fallback: {e}")
-                    continue
-        
-        total_time = time.time() - start_total
-        logger.info(f"🏁 Zakończono w {total_time:.1f}s")
-        logger.info(f"📊 Znaleziono {len(routes)}/{num_routes} tras")
-        
-        return routes
-    
-    def _generate_simple_working_route(self, valid_stops: List[Tuple[float, float]], max_attempts: int = 100) -> List[Tuple[float, float]]:
-        """Generuje prostą trasę która na pewno zadziała."""
-        
-        # W 50% przypadków spróbuj lokalnego podejścia
-        if random.random() < 0.5:
-            local_route = self._generate_local_connected_route(valid_stops, max_attempts=20)
-            if local_route:
-                return local_route
-        
-        # Fallback do oryginalnego algorytmu
-        for attempt in range(max_attempts):
-            try:
-                # Filtruj dostępne przystanki
-                available_stops = [stop for stop in valid_stops 
-                                 if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
-                
-                if len(available_stops) < 3:
-                    return None
-                    
-                # Weź 3-8 losowe przystanki (zwiększone z 4)
-                num_stops = random.randint(3, min(37, len(available_stops)))
-                selected_stops = random.sample(available_stops, num_stops)
-                
-                # BARDZO PODSTAWOWE sprawdzenie odległości
-                valid = True
-                for i in range(len(selected_stops) - 1):
-                    try:
-                        dist = self._calculate_distance(selected_stops[i], selected_stops[i + 1], is_wgs84=True)
-                        # BARDZO liberalne ograniczenia
-                        if not (50 <= dist <= 3000):  # 50m - 3km
-                            valid = False
-                            break
-                    except:
-                        valid = False
-                        break
-                
-                if valid:
-                    # Zwróć prostą trasę - bez _create_connected_route która powoduje problemy
-                    return selected_stops
-                    
-            except Exception as e:
-                logger.debug(f"Błąd w próbie {attempt}: {e}")
-                continue
-        
-        return None
-    
-    def _simple_route_evaluation(self, route: List[Tuple[float, float]]) -> float:
-        """Bardzo prosta ocena trasy - bez skomplikowanych obliczeń."""
-        try:
-            if not route or len(route) < 2:
-                return 0.0
-                
-            # Podstawowa ocena długości
-            total_length = 0
-            for i in range(len(route) - 1):
-                try:
-                    dist = self._calculate_distance(route[i], route[i + 1], is_wgs84=True)
-                    total_length += dist
-                except:
-                    return 0.1  # Fallback
-            
-            # Prosta normalizacja - im krótsza trasa, tym lepiej (w rozsądnych granicach)
-            if 1000 <= total_length <= 10000:  # 1-10km
-                score = 1.0 - (total_length - 1000) / 9000  # 0.1-1.0
-                return max(0.1, score)
-            else:
-                return 0.1
-                
-        except Exception as e:
-            logger.debug(f"Błąd oceny trasy: {e}")
-            return 0.1
-
-    def _generate_local_connected_route(self, valid_stops: List[Tuple[float, float]], max_attempts: int = 50) -> List[Tuple[float, float]]:
-        """
-        Generuje trasę wybierając przystanki w pobliżu siebie dla lepszych połączeń.
-        """
-        for attempt in range(max_attempts):
-            try:
-                # Filtruj dostępne przystanki
-                available_stops = [stop for stop in valid_stops 
-                                 if (round(stop[0], 6), round(stop[1], 6)) not in self.used_stops]
-                
-                if len(available_stops) < 3:
-                    return None
-                
-                # Wybierz losowy punkt startowy
-                current_stop = random.choice(available_stops)
-                route_stops = [current_stop]
-                used_in_route = {current_stop}
-                
-                # Docelowa długość trasy
-                target_length = random.randint(5, 10)
-                
-                # Buduj trasę wybierając najbliższe przystanki
-                for _ in range(target_length - 1):
-                    # Znajdź przystanki w promieniu 500-1200m od ostatniego
-                    candidates = []
-                    for stop in available_stops:
-                        if stop in used_in_route:
-                            continue
-                            
-                        distance = self._calculate_distance(current_stop, stop, is_wgs84=True)
-                        if 300 <= distance <= 1200:  # Rozsądny zakres
-                            candidates.append((stop, distance))
-                    
-                    if not candidates:
-                        break
-                        
-                    # Wybierz jeden z 3 najbliższych (element losowości)
-                    candidates.sort(key=lambda x: x[1])
-                    top_candidates = candidates[:min(3, len(candidates))]
-                    next_stop, _ = random.choice(top_candidates)
-                    
-                    route_stops.append(next_stop)
-                    used_in_route.add(next_stop)
-                    current_stop = next_stop
-                
-                # Sprawdź czy mamy wystarczającą liczbę przystanków
-                if len(route_stops) >= 3:
-                    return route_stops
-                    
-            except Exception as e:
-                logger.debug(f"Błąd generowania lokalnej trasy: {e}")
-                continue
-        
         return None
 
-    def _check_sharp_turns_near_buildings(self, route: List[Tuple[float, float]], danger_radius: float = 10.0) -> bool:
+    def _validate_all_requirements(self, route: List[Tuple[float, float]]) -> bool:
         """
-        NOWA FUNKCJA: Sprawdza czy trasa ma ostre zakręty w pobliżu budynków.
+        NOWA FUNKCJA: Kompleksowa walidacja wszystkich wymagań dla trasy.
         
         Args:
             route: Trasa do sprawdzenia
-            danger_radius: Promień w metrach w którym ostre zakręty są niebezpieczne
             
         Returns:
-            bool: True jeśli wykryto niebezpieczne ostre zakręty
+            bool: True jeśli trasa spełnia WSZYSTKIE wymagania
         """
-        if len(route) < 3 or self.buildings_df is None:
+        if not route or len(route) < 2:
             return False
-        
+            
         try:
-            dangerous_turns = 0
+            # 1. Sprawdź podstawowe ograniczenia trasy
+            if not self._is_valid_route(route, is_simplified=False):
+                logger.debug("❌ Trasa nie spełnia podstawowych ograniczeń")
+                return False
             
-            for i in range(1, len(route) - 1):
-                # Oblicz kąt zakrętu
-                angle = self._calculate_angle(route[i-1], route[i], route[i+1])
-                
-                # Sprawdź czy to ostry zakręt (< 120 stopni = ostry)
-                if angle < 120:
-                    # Sprawdź czy w pobliżu są budynki
-                    turn_point = route[i]
-                    
-                    # Konwertuj punkt zakrętu do EPSG:2180
-                    point_gdf = gpd.GeoDataFrame(
-                        geometry=[Point(turn_point[1], turn_point[0])], 
-                        crs="EPSG:4326"
-                    ).to_crs(epsg=2180)
-                    turn_point_projected = point_gdf.geometry[0]
-                    
-                    # Sprawdź czy są budynki w promieniu niebezpieczeństwa
-                    nearby_buildings = self.buildings_projected[
-                        self.buildings_projected.geometry.distance(turn_point_projected) <= danger_radius
-                    ]
-                    
-                    if len(nearby_buildings) > 0:
-                        dangerous_turns += 1
-                        logger.debug(f"🚨 Niebezpieczny zakręt {angle:.1f}° z {len(nearby_buildings)} budynkami w promieniu {danger_radius}m")
-                        
-                        if dangerous_turns >= 3:  # Limit niebezpiecznych zakrętów
-                            return True
+            # 2. Sprawdź czy nie ma skoków
+            if self._check_for_jumps(route, max_distance=800):
+                logger.debug("❌ Trasa zawiera skoki > 800m")
+                return False
             
-            return False
+            # 3. Sprawdź kolizje z budynkami (nowa elastyczna metoda)
+            if self._check_collision_with_buildings(route):
+                logger.debug("❌ Trasa ma poważne kolizje z budynkami")
+                return False
+            
+            # 4. Sprawdź odległości między przystankami
+            for i in range(len(route) - 1):
+                distance = self._calculate_distance(route[i], route[i + 1], is_wgs84=True)
+                if distance < 300 or distance > 800:  # Elastyczne granice
+                    logger.debug(f"❌ Nieprawidłowa odległość: {distance:.0f}m (300-800m)")
+                    return False
+            
+            # 5. Sprawdź całkowitą długość trasy
+            total_length = self._calculate_total_length(route)
+            if total_length < 1000 or total_length > 8000:  # 1-8km
+                logger.debug(f"❌ Nieprawidłowa długość trasy: {total_length:.0f}m (1000-8000m)")
+                return False
+            
+            logger.debug("✅ Trasa spełnia wszystkie wymagania")
+            return True
             
         except Exception as e:
-            logger.debug(f"Błąd sprawdzania niebezpiecznych zakrętów: {str(e)}")
-            return False  # W przypadku błędu, zakładamy bezpieczeństwo
+            logger.debug(f"❌ Błąd walidacji: {e}")
+            return False
 
     def _validate_route_safety(self, route: List[Tuple[float, float]]) -> Tuple[bool, str]:
         """
-        NOWA FUNKCJA: Kompleksowa walidacja bezpieczeństwa trasy.
+        ULEPSZONE: Sprawdza bezpieczeństwo trasy z nowymi elastycznymi kryteriami.
         
         Args:
             route: Trasa do sprawdzenia
@@ -3023,358 +2684,171 @@ class RouteOptimizer:
         Returns:
             Tuple[bool, str]: (czy_bezpieczna, opis_problemów)
         """
-        if not route or len(route) < 2:
-            return False, "Trasa pusta lub za krótka"
-        
-        safety_issues = []
+        issues = []
         
         try:
-            # 1. Sprawdź kolizje z budynkami
+            # 1. Sprawdź skoki
+            if self._check_for_jumps(route, max_distance=800):
+                issues.append("wykryto skoki > 800m")
+            
+            # 2. Sprawdź kolizje z budynkami (nowa metoda)
             if self._check_collision_with_buildings(route):
-                safety_issues.append("Kolizja z budynkami")
+                issues.append("poważne kolizje z budynkami")
             
-            # 2. Sprawdź kolizje z istniejącymi liniami
-            if self._check_collision_with_existing_lines(route):
-                safety_issues.append("Kolizja z istniejącymi liniami tramwajowymi")
+            # 3. Sprawdź podstawowe ograniczenia
+            if not self._is_valid_route(route, is_simplified=False):
+                issues.append("nie spełnia podstawowych ograniczeń")
             
-            # 3. Sprawdź czy wszystkie segmenty są bezpieczne
-            unsafe_segments = []
-            for i in range(len(route) - 1):
-                segment = [route[i], route[i + 1]]
-                if not self._is_route_safe_from_buildings(segment):
-                    unsafe_segments.append(f"segment {i+1}-{i+2}")
-            
-            if unsafe_segments:
-                safety_issues.append(f"Niebezpieczne segmenty: {', '.join(unsafe_segments)}")
-            
-            # 4. Sprawdź czy trasa nie ma zbyt ostrych zakrętów przez budynki
-            sharp_turns_near_buildings = self._check_sharp_turns_near_buildings(route)
-            if sharp_turns_near_buildings:
-                safety_issues.append("Ostre zakręty w pobliżu budynków")
-            
+            if issues:
+                return False, f"Problemy: {', '.join(issues)}"
+            else:
+                return True, "Trasa spełnia wszystkie kryteria bezpieczeństwa"
+                
         except Exception as e:
-            safety_issues.append(f"Błąd walidacji: {str(e)}")
-        
-        is_safe = len(safety_issues) == 0
-        issues_description = "; ".join(safety_issues) if safety_issues else "Brak problemów"
-        
-        return is_safe, issues_description
+            return False, f"Błąd sprawdzania bezpieczeństwa: {str(e)}"
 
-    def optimize_multiple_routes_with_building_safety(self, num_routes: int = 3, max_time_seconds: int = 300, max_retry_attempts: int = 50) -> List[Tuple[List[Tuple[float, float]], float]]:
+    def _generate_backup_valid_route(self) -> List[Tuple[float, float]]:
         """
-        Optymalizuje wiele tras z GWARANCJĄ BEZPIECZEŃSTWA - odrzuca trasy przechodzące przez budynki.
+        Generuje alternatywną, poprawną trasę gdy optymalizacja się nie powiodła.
+        
+        Returns:
+            List[Tuple[float, float]]: Alternatywna trasa
+        """
+        # Użyj metody _generate_route_with_controlled_distances
+        route = self._generate_route_with_controlled_distances()
+        if route:
+            return route
+        
+        # Jeśli nie udało się wygenerować poprawnej trasy, spróbuj z uproszczoną
+        logger.info("🔄 Próbuję z uproszczonymi parametrami...")
+        simple_route = self._generate_simple_fallback_route()
+        if simple_route:
+            return simple_route
+        
+        # Jeśli nawet to nie zadziała, zwróć pustą listę
+        logger.warning("❌ Nie udało się znaleźć poprawnej trasy - zwracam pustą listę")
+        return []
+
+    def _optimize_intelligent_single_route(self, max_time_seconds: float, route_number: int) -> Tuple[List[Tuple[float, float]], float]:
+        """
+        Optymalizacja jednej trasy z użyciem inteligentnych heurystyk.
         
         Args:
-            num_routes: Liczba tras do znalezienia
             max_time_seconds: Maksymalny czas w sekundach
-            max_retry_attempts: Maksymalna liczba prób dla każdej trasy
+            route_number: Numer trasy
             
         Returns:
-            List[Tuple[List[Tuple[float, float]], float]]: Lista bezpiecznych tras z ich ocenami
-        """
-        start_time = time.time()
-        safe_routes = []
-        total_attempts = 0
-        
-        logger.info(f"🔒 ROZPOCZYNAM OPTYMALIZACJĘ {num_routes} BEZPIECZNYCH TRAS")
-        logger.info(f"⏱️ Limit czasu: {max_time_seconds}s, max prób na trasę: {max_retry_attempts}")
-        
-        self.reset_used_stops()
-        
-        while len(safe_routes) < num_routes and time.time() - start_time < max_time_seconds:
-            route_number = len(safe_routes) + 1
-            logger.info(f"🚊 Szukanie trasy {route_number}/{num_routes}...")
-            
-            attempts_for_this_route = 0
-            found_safe_route = False
-            
-            while attempts_for_this_route < max_retry_attempts and not found_safe_route:
-                attempts_for_this_route += 1
-                total_attempts += 1
-                
-                # Generuj trasę używając szybkiej metody
-                try:
-                    remaining_time = max_time_seconds - (time.time() - start_time)
-                    if remaining_time <= 0:
-                        logger.warning(f"⏰ Przekroczono limit czasu!")
-                        break
-                        
-                    # Użyj prostej szybkiej metody do wygenerowania trasy
-                    route, score = self._optimize_simple_single_route_fast(
-                        max_time_seconds=min(remaining_time / (num_routes - len(safe_routes)), 60),
-                        route_number=route_number
-                    )
-                    
-                    if route and len(route) >= self.constraints.min_route_length:
-                        # KLUCZOWE SPRAWDZENIE BEZPIECZEŃSTWA
-                        has_collision = self._check_collision_with_buildings(route)
-                        is_safe, safety_msg = self._validate_route_safety(route)
-                        
-                        if not has_collision and is_safe:
-                            # TRASA BEZPIECZNA - DODAJEMY
-                            safe_routes.append((route, score))
-                            found_safe_route = True
-                            logger.info(f"✅ ZNALEZIONO BEZPIECZNĄ TRASĘ {route_number} (próba {attempts_for_this_route})")
-                            logger.info(f"📊 Ocena: {score:.2f}, Długość: {len(route)} przystanków")
-                            logger.info(f"🔒 {safety_msg}")
-                        else:
-                            # TRASA NIEBEZPIECZNA - ODRZUCAMY
-                            collision_reason = "kolizja z budynkami" if has_collision else safety_msg
-                            logger.warning(f"❌ ODRZUCONO trasę {route_number} (próba {attempts_for_this_route}): {collision_reason}")
-                            
-                            # Oznacz przystanki z tej trasy jako dostępne ponownie
-                            for stop in route:
-                                if stop in self.used_stops:
-                                    self.used_stops.remove(stop)
-                    else:
-                        logger.warning(f"⚠️ Nie udało się wygenerować trasy {route_number} (próba {attempts_for_this_route})")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ Błąd podczas generowania trasy {route_number}: {e}")
-                    continue
-            
-            if not found_safe_route:
-                logger.error(f"❌ Nie udało się znaleźć bezpiecznej trasy {route_number} po {max_retry_attempts} próbach")
-        
-        elapsed_time = time.time() - start_time
-        
-        # PODSUMOWANIE WYNIKÓW
-        logger.info(f"🏁 ZAKOŃCZONO OPTYMALIZACJĘ BEZPIECZNYCH TRAS")
-        logger.info(f"✅ Znaleziono {len(safe_routes)}/{num_routes} bezpiecznych tras")
-        logger.info(f"⏱️ Czas: {elapsed_time:.1f}s, łączna liczba prób: {total_attempts}")
-        
-        if len(safe_routes) < num_routes:
-            logger.warning(f"⚠️ Nie udało się znaleźć wszystkich {num_routes} bezpiecznych tras")
-            logger.warning(f"📊 Zwiększ max_retry_attempts lub max_time_seconds")
-        else:
-            logger.info(f"🎉 SUKCES! Wszystkie trasy są bezpieczne i nie przechodzą przez budynki!")
-        
-        return safe_routes
-
-    def _optimize_simple_single_route_fast(self, max_time_seconds: float, route_number: int) -> Tuple[List[Tuple[float, float]], float]:
-        """
-        Szybka optymalizacja pojedynczej trasy.
+            Tuple[List[Tuple[float, float]], float]: Najlepsza trasa i ocena
         """
         start_time = time.time()
         
-        try:
-            # Znajdź dostępne przystanki (nie używane przez inne trasy)
-            available_stops = [
-                (stop.geometry.y, stop.geometry.x) 
-                for _, stop in self.stops_df.iterrows()
-                if (stop.geometry.y, stop.geometry.x) not in self.used_stops
-            ]
-            
-            if len(available_stops) < self.constraints.min_route_length:
-                logger.warning(f"Za mało dostępnych przystanków: {len(available_stops)}")
-                return [], 0
-            
-            best_route = []
-            best_score = float('-inf')
-            attempts = 0
-            max_attempts = 20
-            
-            while time.time() - start_time < max_time_seconds and attempts < max_attempts:
-                attempts += 1
-                
-                # Generuj prostą trasę
-                route = self._generate_simple_working_route(
-                    available_stops, 
-                    max_attempts=10
-                )
-                
-                if route and self._fast_validate_route(route):
-                    score = self._fast_evaluate_route(route)
-                    if score > best_score:
-                        best_route = route
-                        best_score = score
-            
-            if best_route:
-                # Zaznacz przystanki jako używane
-                for stop in best_route:
-                    self.used_stops.add(stop)
-                    
-            return best_route, best_score
-            
-        except Exception as e:
-            logger.error(f"Błąd w _optimize_simple_single_route_fast: {e}")
-            return [], 0
+        # Użyj metody _generate_route_with_controlled_distances
+        route = self._generate_route_with_controlled_distances()
+        if route:
+            return route, self._evaluate_route(route)
+        
+        # Jeśli nie udało się wygenerować trasy, spróbuj z uproszczoną
+        logger.info(f"🔄 Próbuję z uproszczonymi parametrami dla trasy {route_number}")
+        simple_route = self._generate_simple_fallback_route()
+        if simple_route:
+            return simple_route, self._evaluate_route(simple_route)
+        
+        # Jeśli nawet to nie zadziała, zwróć pustą listę
+        logger.warning(f"❌ Nie udało się znaleźć trasy {route_number} - zwracam pustą listę")
+        return [], float('-inf')
 
-    def _check_collision_with_buildings_fast(self, route: List[Tuple[float, float]], sample_ratio: float = 0.1) -> bool:
+    def _precompute_density_cache(self):
         """
-        SZYBKA wersja sprawdzania kolizji z budynkami - używa próbkowania.
+        Tworzy cache gęstości zabudowy dla przystanków.
+        
+        Wartości są obliczane na podstawie gęstości zaludnienia w promieniu 300m.
+        """
+        logger.info("Tworzenie cache gęstości zabudowy...")
+        self.density_cache = {}
+        
+        for stop in self.stops_df.iterrows():
+            coords = (stop[1].geometry.y, stop[1].geometry.x)
+            density = self.density_calculator.calculate_density(coords)
+            self.density_cache[coords] = density
+        
+        logger.info("Cache gęstości zabudowy utworzony")
+
+    def _precompute_valid_connections(self):
+        """
+        Tworzy cache prawidłowych odległości między przystankami.
+        
+        Wartości są obliczane na podstawie odległości między przystankami.
+        """
+        logger.info("Tworzenie cache prawidłowych odległości między przystankami...")
+        self.valid_connections = {}
+        
+        for i in range(len(self.stops_df)):
+            for j in range(i + 1, len(self.stops_df)):
+                stop1 = self.stops_df.iloc[i].geometry.coords[0]
+                stop2 = self.stops_df.iloc[j].geometry.coords[0]
+                distance = self._calculate_distance(stop1, stop2, is_wgs84=True)
+                self.valid_connections[(i, j)] = distance
+        
+        logger.info("Cache prawidłowych odległości między przystankami utworzony")
+
+    def _optimize_intelligent_single_route(self, max_time_seconds: float, route_number: int) -> Tuple[List[Tuple[float, float]], float]:
+        """
+        Optymalizacja jednej trasy z użyciem inteligentnych heurystyk.
         
         Args:
-            route: Trasa do sprawdzenia
-            sample_ratio: Jaki % budynków sprawdzać (0.1 = 10%)
-            
-        Returns:
-            bool: True jeśli wykryto kolizję
-        """
-        if self.buildings_df is None or len(route) < 2:
-            return False
-            
-        try:
-            # OPTYMALIZACJA 1: Użyj tylko próbki budynków
-            buildings_sample_size = max(100, int(len(self.buildings_df) * sample_ratio))
-            buildings_sample = self.buildings_df.sample(n=min(buildings_sample_size, len(self.buildings_df)))
-            
-            # OPTYMALIZACJA 2: Większa tolerancja dla hackathonu
-            min_distance = self.constraints.min_distance_from_buildings * 0.7  # 70% oryginalnej wartości
-            
-            # Konwertuj trasę do linii
-            route_line = LineString([(lon, lat) for lat, lon in route])
-            
-            # OPTYMALIZACJA 3: Sprawdź tylko budynki w pobliżu trasy  
-            route_bounds = route_line.bounds
-            buffer_size = 0.001  # ~100m buffer w stopniach
-            
-            buildings_near_route = buildings_sample[
-                (buildings_sample.geometry.bounds['minx'] < route_bounds[2] + buffer_size) &
-                (buildings_sample.geometry.bounds['maxx'] > route_bounds[0] - buffer_size) &
-                (buildings_sample.geometry.bounds['miny'] < route_bounds[3] + buffer_size) &
-                (buildings_sample.geometry.bounds['maxy'] > route_bounds[1] - buffer_size)
-            ]
-            
-            if len(buildings_near_route) == 0:
-                return False
-                
-            # OPTYMALIZACJA 4: Sprawdź tylko czy trasa PRZECINA budynki (nie odległość)
-            for _, building in buildings_near_route.iterrows():
-                if hasattr(building.geometry, 'intersects'):
-                    if route_line.intersects(building.geometry):
-                        return True  # Bezpośrednia kolizja
-                        
-            return False
-            
-        except Exception as e:
-            logger.warning(f"Błąd w sprawdzaniu kolizji (szybka wersja): {e}")
-            return False  # W razie błędu uznaj za bezpieczną
-
-    def optimize_multiple_routes_with_building_safety_fast(self, num_routes: int = 3, max_time_seconds: int = 180, max_retry_attempts: int = 20) -> List[Tuple[List[Tuple[float, float]], float]]:
-        """
-        SZYBKA wersja optymalizacji wielu tras z bezpieczeństwem.
-        
-        Args:
-            num_routes: Liczba tras do znalezienia
             max_time_seconds: Maksymalny czas w sekundach
-            max_retry_attempts: Maksymalna liczba prób dla każdej trasy
+            route_number: Numer trasy
             
         Returns:
-            List[Tuple[List[Tuple[float, float]], float]]: Lista bezpiecznych tras z ich ocenami
+            Tuple[List[Tuple[float, float]], float]: Najlepsza trasa i ocena
         """
         start_time = time.time()
-        safe_routes = []
-        total_attempts = 0
         
-        logger.info(f"🚀 ROZPOCZYNAM SZYBKĄ OPTYMALIZACJĘ {num_routes} BEZPIECZNYCH TRAS")
-        logger.info(f"⚡ Optymalizacje: próbkowanie budynków, większa tolerancja, szybsze sprawdzanie")
-        logger.info(f"⏱️ Limit czasu: {max_time_seconds}s, max prób na trasę: {max_retry_attempts}")
+        # Użyj metody _generate_route_with_controlled_distances
+        route = self._generate_route_with_controlled_distances()
+        if route:
+            return route, self._evaluate_route(route)
         
-        self.reset_used_stops()
+        # Jeśli nie udało się wygenerować trasy, spróbuj z uproszczoną
+        logger.info(f"🔄 Próbuję z uproszczonymi parametrami dla trasy {route_number}")
+        simple_route = self._generate_simple_fallback_route()
+        if simple_route:
+            return simple_route, self._evaluate_route(simple_route)
         
-        while len(safe_routes) < num_routes and time.time() - start_time < max_time_seconds:
-            route_number = len(safe_routes) + 1
-            logger.info(f"🚊 Szukanie trasy {route_number}/{num_routes}...")
-            
-            attempts_for_this_route = 0
-            found_safe_route = False
-            
-            while attempts_for_this_route < max_retry_attempts and not found_safe_route:
-                attempts_for_this_route += 1
-                total_attempts += 1
-                
-                try:
-                    remaining_time = max_time_seconds - (time.time() - start_time)
-                    if remaining_time <= 5:  # Zostało mniej niż 5 sekund
-                        logger.warning(f"⏰ Mało czasu, przerywam!")
-                        break
-                        
-                    # SZYBSZE GENEROWANIE TRASY
-                    route, score = self._generate_ultra_fast_route(route_number)
-                    
-                    if route and len(route) >= self.constraints.min_route_length:
-                        # SZYBKIE SPRAWDZENIE BEZPIECZEŃSTWA
-                        has_collision = self._check_collision_with_buildings_fast(route, sample_ratio=0.05)  # Tylko 5% budynków
-                        
-                        # UPROSZCZONA WALIDACJA
-                        basic_valid = (
-                            len(route) <= self.constraints.max_route_length and
-                            not has_collision
-                        )
-                        
-                        if basic_valid:
-                            # TRASA BEZPIECZNA - DODAJEMY
-                            safe_routes.append((route, score))
-                            found_safe_route = True
-                            logger.info(f"✅ ZNALEZIONO BEZPIECZNĄ TRASĘ {route_number} (próba {attempts_for_this_route})")
-                            logger.info(f"📊 Ocena: {score:.2f}, Długość: {len(route)} przystanków")
-                        else:
-                            # TRASA NIEBEZPIECZNA - ODRZUCAMY
-                            logger.debug(f"❌ ODRZUCONO trasę {route_number} (próba {attempts_for_this_route}): {'kolizja' if has_collision else 'za długa'}")
-                            
-                            # Zwolnij przystanki
-                            for stop in route:
-                                if stop in self.used_stops:
-                                    self.used_stops.remove(stop)
-                    else:
-                        logger.debug(f"⚠️ Nie udało się wygenerować trasy {route_number} (próba {attempts_for_this_route})")
-                        
-                except Exception as e:
-                    logger.debug(f"⚠️ Błąd podczas generowania trasy {route_number}: {e}")
-                    continue
-            
-            if not found_safe_route:
-                logger.warning(f"❌ Nie udało się znaleźć bezpiecznej trasy {route_number} po {max_retry_attempts} próbach")
-        
-        elapsed_time = time.time() - start_time
-        
-        # PODSUMOWANIE WYNIKÓW
-        logger.info(f"🏁 ZAKOŃCZONO SZYBKĄ OPTYMALIZACJĘ")
-        logger.info(f"✅ Znaleziono {len(safe_routes)}/{num_routes} bezpiecznych tras")
-        logger.info(f"⏱️ Czas: {elapsed_time:.1f}s, łączna liczba prób: {total_attempts}")
-        logger.info(f"🚀 Średnio {elapsed_time/max(1,total_attempts):.2f}s na próbę")
-        
-        if len(safe_routes) < num_routes:
-            logger.warning(f"⚠️ Nie udało się znaleźć wszystkich {num_routes} tras")
-        else:
-            logger.info(f"🎉 SUKCES! Wszystkie trasy są relatywnie bezpieczne!")
-        
-        return safe_routes
+        # Jeśli nawet to nie zadziała, zwróć pustą listę
+        logger.warning(f"❌ Nie udało się znaleźć trasy {route_number} - zwracam pustą listę")
+        return [], float('-inf')
 
-    def _generate_ultra_fast_route(self, route_number: int) -> Tuple[List[Tuple[float, float]], float]:
+    def _precompute_density_cache(self):
         """
-        Ultra szybkie generowanie trasy - bez skomplikowanych algorytmów.
+        Tworzy cache gęstości zabudowy dla przystanków.
+        
+        Wartości są obliczane na podstawie gęstości zaludnienia w promieniu 300m.
         """
-        try:
-            # Znajdź dostępne przystanki
-            available_stops = [
-                (stop.geometry.y, stop.geometry.x) 
-                for _, stop in self.stops_df.iterrows()
-                if (stop.geometry.y, stop.geometry.x) not in self.used_stops
-            ]
-            
-            if len(available_stops) < self.constraints.min_route_length:
-                return [], 0
-            
-            # LOSOWA TRASA - najszybsza metoda
-            import random
-            num_stops = random.randint(
-                self.constraints.min_route_length, 
-                min(self.constraints.max_route_length, len(available_stops))
-            )
-            
-            route = random.sample(available_stops, num_stops)
-            
-            # Zaznacz przystanki jako używane
-            for stop in route:
-                self.used_stops.add(stop)
-                
-            # Prosta ocena - im więcej przystanków tym lepiej
-            score = len(route) * 10
-                
-            return route, score
-            
-        except Exception as e:
-            logger.error(f"Błąd w _generate_ultra_fast_route: {e}")
-            return [], 0
+        logger.info("Tworzenie cache gęstości zabudowy...")
+        self.density_cache = {}
+        
+        for stop in self.stops_df.iterrows():
+            coords = (stop[1].geometry.y, stop[1].geometry.x)
+            density = self.density_calculator.calculate_density(coords)
+            self.density_cache[coords] = density
+        
+        logger.info("Cache gęstości zabudowy utworzony")
+
+    def _precompute_valid_connections(self):
+        """
+        Tworzy cache prawidłowych odległości między przystankami.
+        
+        Wartości są obliczane na podstawie odległości między przystankami.
+        """
+        logger.info("Tworzenie cache prawidłowych odległości między przystankami...")
+        self.valid_connections = {}
+        
+        for i in range(len(self.stops_df)):
+            for j in range(i + 1, len(self.stops_df)):
+                stop1 = self.stops_df.iloc[i].geometry.coords[0]
+                stop2 = self.stops_df.iloc[j].geometry.coords[0]
+                distance = self._calculate_distance(stop1, stop2, is_wgs84=True)
+                self.valid_connections[(i, j)] = distance
+        
+        logger.info("Cache prawidłowych odległości między przystankami utworzony")
