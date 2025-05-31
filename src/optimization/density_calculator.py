@@ -22,20 +22,26 @@ class DensityCalculator:
         # Konwersja promienia z metrów na stopnie (przybliżone)
         self.radius_degrees = radius_meters / 111000  # 1 stopień ≈ 111km
         
-    def calculate_density_at_point(self, point: Tuple[float, float]) -> float:
+    def calculate_density_at_point(self, lon: float, lat: float, radius: float = None) -> float:
         """
         Oblicza gęstość zabudowy w danym punkcie.
         
         Args:
-            point (Tuple[float, float]): Współrzędne punktu (latitude, longitude)
+            lon (float): Longitude
+            lat (float): Latitude  
+            radius (float): Promień w metrach (opcjonalny, domyślnie użyje self.radius_meters)
             
         Returns:
-            float: Gęstość zabudowy w promieniu radius_meters od punktu
+            float: Gęstość zabudowy w promieniu od punktu
         """
-        lat, lon = point
+        if radius is None:
+            radius = self.radius_meters
+            
+        # Konwersja promienia z metrów na stopnie (przybliżone)
+        radius_degrees = radius / 111000  # 1 stopień ≈ 111km
         
         # Tworzenie okręgu wokół punktu
-        circle = Point(lon, lat).buffer(self.radius_degrees)
+        circle = Point(lon, lat).buffer(radius_degrees)
         
         # Znajdowanie budynków w zasięgu
         buildings_in_range = self.buildings_df[self.buildings_df.geometry.intersects(circle)]
@@ -64,7 +70,7 @@ class DensityCalculator:
         Returns:
             float: Średnia gęstość zabudowy dla trasy
         """
-        densities = [self.calculate_density_at_point(point) for point in route_points]
+        densities = [self.calculate_density_at_point(point[0], point[1]) for point in route_points]
         return np.mean(densities)
     
     def get_density_map(self, grid_size: float = 0.001, bounds: Optional[Tuple[float, float, float, float]] = None) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
@@ -94,6 +100,6 @@ class DensityCalculator:
         
         for i, lat in enumerate(lats):
             for j, lon in enumerate(lons):
-                density_map[i, j] = self.calculate_density_at_point((lat, lon))
+                density_map[i, j] = self.calculate_density_at_point(lon, lat)
                 
         return density_map, (min_lon, min_lat, max_lon, max_lat) 

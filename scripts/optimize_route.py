@@ -44,36 +44,45 @@ def main():
     data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
     buildings_df, streets_df, stops_df, lines_df = load_data(data_dir)
     
-    # Konfiguracja ograniczeń
+    # KONFIGURACJA OGRANICZEŃ - ZAKTUALIZOWANE NA PODSTAWIE ANALIZY DANYCH KRAKOWA
     constraints = RouteConstraints(
-        min_distance_between_stops=200,  # 200m między przystankami
-        max_distance_between_stops=1500,  # 1500m między przystankami
-        max_angle=60,  # maksymalny kąt zakrętu
-        min_route_length=3,  # minimalna liczba przystanków
-        max_route_length=20,  # maksymalna liczba przystanków
-        min_total_length=1000,  # minimalna długość trasy
-        max_total_length=15000,  # maksymalna długość trasy
-        min_distance_from_buildings=3  # minimalna odległość od budynków
+        # REALISTYCZNE ODLEGŁOŚCI (analiza 21 linii: mediana 495m, percentile 25-75: 393-621m)
+        min_distance_between_stops=350,   # Nieco luźniej niż 25th percentile (393m)
+        max_distance_between_stops=700,   # Bardziej elastycznie niż 75th percentile (621m)
+        
+        # REALISTYCZNE DŁUGOŚCI TRAS (analiza: min 1.1km, max 24.4km, średnia 14.5km)
+        min_total_length=1500,            # Sensowne minimum (1.5km)
+        max_total_length=15000,           # Umiarkowane dla hackathonu (15km)
+        
+        # REALISTYCZNA LICZBA PRZYSTANKÓW (analiza: 4-37 przystanków, średnia 24)
+        min_route_length=4,               # Minimum jak w realnych danych
+        max_route_length=15,              # Umiarkowane dla hackathonu
+        
+        # ZACHOWANE ZAŁOŻENIA HACKATHONU + BEZPIECZEŃSTWO
+        max_angle=45.0,                   # Proste trasy (wymaganie #3)
+        min_distance_from_buildings=5.0   # ZWIĘKSZONE bezpieczeństwo (było 3)
     )
     
-    # Inicjalizacja optymalizatora
-    logger.info("Inicjalizacja optymalizatora...")
+    # Inicjalizacja optymalizatora z REALISTYCZNYMI parametrami
+    logger.info("Inicjalizacja optymalizatora z realistycznymi parametrami Krakowa...")
     optimizer = RouteOptimizer(
         buildings_df=buildings_df,
         streets_df=streets_df,
         stops_df=stops_df,
         lines_df=lines_df,
         constraints=constraints,
-        population_size=100,
-        generations=50,
-        mutation_rate=0.1,
+        population_size=50,               # Zmniejszone dla szybszego działania
+        generations=20,                   # Zmniejszone dla szybszego działania
+        mutation_rate=0.15,              # Nieco więcej mutacji
         crossover_rate=0.8,
-        population_weight=0.7,  # waga dla kryterium gęstości zaludnienia
-        distance_weight=0.3     # waga dla kryterium odległości
+        population_weight=0.6,            # Nieco mniej wagi na gęstość
+        distance_weight=0.3,              # Więcej na odległości
+        angle_weight=0.1                  # Waga dla prostoty tras
     )
     
     # Uruchomienie optymalizacji
-    logger.info("Rozpoczynam optymalizację...")
+    logger.info("🚊 Rozpoczynam optymalizację z mechanizmami bezpieczeństwa...")
+    logger.info("🔒 Automatyczne sprawdzanie kolizji z budynkami jest włączone")
     
     # Wybór punktów startowego i końcowego z najgęściej zaludnionych przystanków
     # Użyjemy TOP przystanków znalezionych przez optymalizator
@@ -92,8 +101,8 @@ def main():
     best_route, best_score = optimizer.optimize_route(
         start_point=start_point,
         end_point=end_point,
-        num_stops=5,  # liczba przystanków
-        max_iterations=100  # zmniejszono dla szybszego testowania
+        num_stops=8,  # REALISTYCZNA liczba przystanków dla jednej trasy
+        max_iterations=500  # Zmniejszone dla szybszego działania
     )
     
     if best_route is None:
@@ -101,6 +110,27 @@ def main():
         return
         
     logger.info(f"Znaleziono trasę z oceną: {best_score:.2f}")
+    
+    # 🔒 SPRAWDZENIE BEZPIECZEŃSTWA ZNALEZIONEJ TRASY
+    logger.info("🔍 Sprawdzanie bezpieczeństwa znalezionej trasy...")
+    is_safe, safety_msg = optimizer._validate_route_safety(best_route)
+    
+    if is_safe:
+        logger.info(f"✅ TRASA BEZPIECZNA: {safety_msg}")
+    else:
+        logger.warning(f"⚠️ UWAGA - {safety_msg}")
+        
+    # Dodatkowe sprawdzenie kolizji z budynkami
+    has_collision = optimizer._check_collision_with_buildings(best_route)
+    if has_collision:
+        logger.warning("⚠️ WYKRYTO KOLIZJĘ Z BUDYNKAMI!")
+    else:
+        logger.info("✅ Brak kolizji z budynkami")
+    
+    # Szczegółowe informacje o trasie
+    total_length = optimizer._calculate_total_length(best_route)
+    logger.info(f"📏 Długość trasy: {total_length:.0f} metrów")
+    logger.info(f"🚏 Liczba przystanków: {len(best_route)}")
     
     # Inicjalizacja wizualizatora
     visualizer = RouteVisualizer(buildings_df, streets_df)

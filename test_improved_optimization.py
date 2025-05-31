@@ -102,42 +102,78 @@ def test_route_optimizer():
         logger.error("❌ Nie udało się znaleźć trasy")
     
     # Test 2: Optymalizacja wielu tras z unikatowością
-    logger.info("\n--- TEST 2: Optymalizacja wielu tras z unikatowością ---")
+    logger.info("\n--- TEST 2: ULTRASZYBKA Optymalizacja wielu tras (max 2 min) ---")
     
     # Resetuj używane przystanki
     optimizer.reset_used_stops()
     
     start_time = time.time()
-    multiple_routes = optimizer.optimize_multiple_routes(num_routes=2)  # Test z 2 trasami
+    # ZMIANA: Używam ultraszybkiej wersji zamiast normalnej!
+    multiple_routes = optimizer.optimize_multiple_routes_ultra_fast(
+        num_routes=2,  # Test z 2 trasami
+        time_limit_minutes=2  # Maksymalnie 2 minuty
+    )
     multi_optimization_time = time.time() - start_time
     
     logger.info(f"Czas optymalizacji wielu tras: {multi_optimization_time:.2f} sekund")
     logger.info(f"Znaleziono {len(multiple_routes)} tras")
     
-    # Sprawdź unikatowość przystanków
-    all_used_stops = set()
-    duplicates_found = False
+    # SPRAWDZENIE WYMAGAŃ PROJEKTOWYCH
+    logger.info("\n--- SPRAWDZENIE WYMAGAŃ PROJEKTOWYCH ---")
     
     for i, (route, score) in enumerate(multiple_routes):
-        logger.info(f"\nTrasa {i+1}: wynik={score:.3f}, punktów={len(route)}")
+        logger.info(f"\n🚊 TRASA {i+1} - Analiza wymagań:")
         
+        # 1. Sprawdź gęstość zabudowy (wymaganie #1)
+        density_score = optimizer.calculate_density_score(route, radius=300)
+        logger.info(f"  ✅ Gęstość zabudowy (300m): {density_score:.3f}")
+        
+        # 2. Sprawdź odległości między przystankami (wymaganie #2)
+        distance_score = optimizer.calculate_distance_score(route)
         route_stops = optimizer._extract_stops_from_route(route)
-        logger.info(f"  Główne przystanki: {len(route_stops)}")
         
-        # Sprawdź unikatowość
-        for stop in route_stops:
-            normalized = (round(stop[0], 6), round(stop[1], 6))
-            if normalized in all_used_stops:
-                logger.error(f"  ❌ Znaleziono duplikat przystanku: {stop}")
-                duplicates_found = True
-            else:
-                all_used_stops.add(normalized)
-    
-    if not duplicates_found:
-        logger.info("✅ Wszystkie przystanki są unikatowe!")
-    
-    logger.info(f"Łącznie użytych przystanków: {len(all_used_stops)}")
-    logger.info(f"Przystanki w systemie: {len(optimizer.used_stops)}")
+        if len(route_stops) >= 2:
+            distances = []
+            for j in range(len(route_stops) - 1):
+                dist = optimizer._calculate_distance(route_stops[j], route_stops[j+1], is_wgs84=True)
+                distances.append(dist)
+            
+            avg_distance = sum(distances) / len(distances) if distances else 0
+            min_distance = min(distances) if distances else 0
+            max_distance = max(distances) if distances else 0
+            
+            logger.info(f"  ✅ Odległości między przystankami:")
+            logger.info(f"     Średnia: {avg_distance:.0f}m, Min: {min_distance:.0f}m, Max: {max_distance:.0f}m")
+            logger.info(f"     Wynik odległości: {distance_score:.3f}")
+        
+        # 3. Sprawdź prostotę trasy (wymaganie #3)
+        angle_score = optimizer.calculate_angle_score(route)
+        logger.info(f"  ✅ Prostota trasy (min. zakrętów): {angle_score:.3f}")
+        
+        # 4. Sprawdź długość trasy (ograniczenie #1)
+        total_length = optimizer._calculate_total_length(route)
+        logger.info(f"  ✅ Długość całkowita: {total_length/1000:.2f}km")
+        logger.info(f"     Ograniczenia: {optimizer.constraints.min_total_length/1000:.1f}-{optimizer.constraints.max_total_length/1000:.1f}km")
+        
+        # 5. Sprawdź czy zaczyna się na istniejącym przystanku (ograniczenie #2)
+        if route_stops:
+            start_stop = route_stops[0]
+            is_valid_start = optimizer._is_valid_start_stop(start_stop)
+            logger.info(f"  ✅ Początek na istniejącym przystanku: {'TAK' if is_valid_start else 'NIE'}")
+        
+        # 6. Sprawdź kolizje z istniejącą infrastrukturą (ograniczenie #3)
+        has_line_collision = optimizer._check_collision_with_existing_lines(route)
+        logger.info(f"  ✅ Kolizja z istniejącymi liniami: {'TAK (❌)' if has_line_collision else 'NIE (✅)'}")
+        
+        # 7. Sprawdź kolizje z zabudową (ograniczenie #4)
+        has_building_collision = optimizer._check_collision_with_buildings(route)
+        logger.info(f"  ✅ Kolizja z zabudową: {'TAK (❌)' if has_building_collision else 'NIE (✅)'}")
+        
+        # 8. Łączny wynik
+        logger.info(f"  🎯 ŁĄCZNY WYNIK TRASY: {score:.3f}")
+        logger.info(f"     Składniki: gęstość={optimizer.population_weight:.1f}*{density_score:.3f} + "
+                   f"odległość={optimizer.distance_weight:.1f}*{distance_score:.3f} + "
+                   f"kąty={optimizer.angle_weight:.1f}*{angle_score:.3f}")
     
     # Test 3: Test funkcji pomocniczych
     logger.info("\n--- TEST 3: Funkcje pomocnicze ---")

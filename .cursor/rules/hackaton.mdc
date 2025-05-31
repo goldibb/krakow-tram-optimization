@@ -1,0 +1,35 @@
+---
+description: Its usefull to keep the project to its core things
+globs: 
+alwaysApply: false
+---
+Upewniaj się że wszystkie zmiany pillnują tych zalóżeń:
+
+Twoim zadaniem jest opracowanie modelu optymalizacyjnego, który 
+wyznaczy przebieg nowej linii tramwajowej w wybranej części 
+Krakowa. Model powinien bazować na dostarczonym skrypcie 
+wykorzystującym dane przestrzenne z OpenStreetMap (OSM) oraz 
+dane operacyjne z systemu TTSS (System Nadzoru Ruchu 
+Tramwajowego). 
+Celem jest zaprojektowanie trasy, która: 
+1. Maksymalizuje pokrycie obszarów o dużej gęstości 
+zabudowy – na podstawie danych buildings_df należy 
+zaprojektować funkcję gęstości i tak dobrać trasę, aby obszar w 
+promieniu 300 metrów od przystanków miał możliwie 
+najwyższą średnią gęstością zabudowy. 
+2. Maksymalizuje dystans między przystankami – unikanie 
+nadmiernej liczby przystanków w małych odległościach od 
+siebie. 
+3. (Opcjonalnie) Minimalizuje liczbę zakrętów – możliwie proste 
+trasy, bez nadmiaru skrzyżowań i łuków. 
+Projektowana trasa powinna spełniać następujące warunki: 
+1. Ograniczenia długości trasy – należy zdefiniować minimalną i 
+maksymalną długość całkowitą. 
+2. Początek na istniejącym przystanku – trasa musi rozpoczynać 
+się w jednym z przystanków znajdujących się w stops_df. 
+3. Brak kolizji z istniejącą infrastrukturą tramwajową – 
+projektowana trasa nie może pokrywać się z trasami zawartymi 
+w lines_df. 
+4. Unikanie kolizji z zabudową – należy uwzględnić geometrię 
+
+budynków z buildings_df.  
