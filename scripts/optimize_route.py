@@ -150,15 +150,31 @@ def main():
     results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'results')
     os.makedirs(results_dir, exist_ok=True)
     
-    # Tworzenie mapy
+    # Tworzenie mapy z inteligentną wizualizacją (unika "przeskakiwania")
     m = visualizer.create_base_map()
-    visualizer.plot_route(best_route, m, route_name="Zoptymalizowana trasa", color='red')
     
-    # Zapisanie mapy
-    map_path = os.path.join(results_dir, "optimized_route.html")
-    m.save(map_path)
+    # OPCJA 1: Tylko przystanki (bez łączących linii)
+    visualizer.plot_stops_only(best_route, m, route_name="Przystanki tramwajowe", color='red')
     
-    logger.info(f"Wizualizacja zapisana w {map_path}")
+    # OPCJA 2: Segmenty z kontrolą długości (dodatkowa mapa)
+    m_segments = visualizer.create_base_map()
+    visualizer.plot_route_segments(
+        best_route, 
+        m_segments, 
+        route_name="Zoptymalizowana trasa (segmenty)", 
+        color='red',
+        max_segment_length=1500  # Segmenty dłuższe niż 1.5km będą potraktowane jako "przeskoki"
+    )
+    
+    # Zapisanie map
+    map_stops_path = os.path.join(results_dir, "optimized_route_stops_only.html")
+    map_segments_path = os.path.join(results_dir, "optimized_route_segments.html")
+    
+    m.save(map_stops_path)
+    m_segments.save(map_segments_path)
+    
+    logger.info(f"Wizualizacja (tylko przystanki) zapisana w {map_stops_path}")
+    logger.info(f"Wizualizacja (segmenty) zapisana w {map_segments_path}")
 
 if __name__ == "__main__":
     main() 

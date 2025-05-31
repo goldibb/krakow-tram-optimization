@@ -9,6 +9,7 @@ import branca.colormap as cm
 import logging
 import time
 from IPython.display import display, clear_output
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -295,4 +296,145 @@ class RouteVisualizer:
         # Wyświetlanie mapy
         display(m)
         clear_output(wait=True)
-        time.sleep(update_interval) 
+        time.sleep(update_interval)
+    
+    def plot_stops_only(
+        self,
+        route: List[Tuple[float, float]],
+        map_obj: Optional[folium.Map] = None,
+        route_name: str = "Przystanki",
+        color: str = 'blue',
+        show_numbers: bool = True
+    ) -> folium.Map:
+        """
+        Dodaje tylko przystanki do mapy bez łączących linii (unika "przeskakiwania").
+        
+        Args:
+            route: Lista punktów przystanków
+            map_obj: Obiekt mapy (opcjonalny)
+            route_name: Nazwa tras
+            color: Kolor markerów
+            show_numbers: Czy pokazywać numery przystanków
+            
+        Returns:
+            folium.Map: Obiekt mapy z dodanymi przystankami
+        """
+        if map_obj is None:
+            map_obj = self.create_base_map()
+            
+        # Dodawanie markerów przystanków BEZ łączącej linii
+        for i, (lat, lon) in enumerate(route):
+            popup_text = f'{route_name} - Przystanek {i+1}' if show_numbers else f'{route_name}'
+            
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=8,
+                color=color,
+                fill=True,
+                fillColor=color,
+                fillOpacity=0.7,
+                popup=popup_text,
+                name=popup_text
+            ).add_to(map_obj)
+            
+            # Opcjonalnie dodaj numer przystanku jako tekst
+            if show_numbers:
+                folium.Marker(
+                    location=[lat, lon],
+                    icon=folium.DivIcon(
+                        html=f'<div style="font-size: 12px; color: white; font-weight: bold; text-align: center; background-color: {color}; border-radius: 50%; width: 20px; height: 20px; line-height: 20px;">{i+1}</div>',
+                        icon_size=(20, 20),
+                        icon_anchor=(10, 10)
+                    )
+                ).add_to(map_obj)
+            
+        return map_obj
+    
+    def plot_route_segments(
+        self,
+        route: List[Tuple[float, float]],
+        map_obj: Optional[folium.Map] = None,
+        route_name: str = "Trasa segmentowa",
+        color: str = 'blue',
+        weight: int = 4,
+        opacity: float = 0.8,
+        max_segment_length: float = 2000  # maksymalna długość segmentu w metrach
+    ) -> folium.Map:
+        """
+        Dodaje trasę do mapy jako oddzielne segmenty (unika długich "przeskoków").
+        
+        Args:
+            route: Lista punktów trasy
+            map_obj: Obiekt mapy (opcjonalny)
+            route_name: Nazwa trasy
+            color: Kolor linii
+            weight: Grubość linii
+            opacity: Przezroczystość linii
+            max_segment_length: Maksymalna długość segmentu w metrach
+            
+        Returns:
+            folium.Map: Obiekt mapy z dodaną trasą
+        """
+        if map_obj is None:
+            map_obj = self.create_base_map()
+            
+        # Funkcja pomocnicza do obliczania odległości w metrach
+        def calculate_distance_meters(lat1, lon1, lat2, lon2):
+            R = 6371000  # promień Ziemi w metrach
+            lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+            return 2 * R * math.asin(math.sqrt(a))
+            
+        # Dodawanie segmentów trasy (tylko te o rozsądnej długości)
+        for i in range(len(route) - 1):
+            lat1, lon1 = route[i]
+            lat2, lon2 = route[i + 1]
+            
+            # Sprawdź długość segmentu
+            segment_length = calculate_distance_meters(lat1, lon1, lat2, lon2)
+            
+            if segment_length <= max_segment_length:
+                # Dodaj segment jako osobną linię
+                folium.PolyLine(
+                    locations=[[lat1, lon1], [lat2, lon2]],
+                    color=color,
+                    weight=weight,
+                    opacity=opacity,
+                    name=f"{route_name} - Segment {i+1}",
+                    popup=f"Segment {i+1}-{i+2}: {segment_length:.0f}m"
+                ).add_to(map_obj)
+            else:
+                # Segment za długi - prawdopodobnie "przeskok", rysuj tylko przystanki
+                folium.CircleMarker(
+                    location=[lat1, lon1],
+                    radius=6,
+                    color='orange',
+                    fill=True,
+                    popup=f'Przystanek {i+1} (przeskok: {segment_length:.0f}m)',
+                    name=f'Przystanek {i+1}'
+                ).add_to(map_obj)
+                
+                if i == len(route) - 2:  # Ostatni punkt
+                    folium.CircleMarker(
+                        location=[lat2, lon2],
+                        radius=6,
+                        color='orange',
+                        fill=True,
+                        popup=f'Przystanek {i+2}',
+                        name=f'Przystanek {i+2}'
+                    ).add_to(map_obj)
+        
+        # Dodawanie markerów przystanków
+        for i, (lat, lon) in enumerate(route):
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=6,
+                color='red',
+                fill=True,
+                popup=f'Przystanek {i+1}',
+                name=f'Przystanek {i+1}'
+            ).add_to(map_obj)
+            
+        return map_obj 
